@@ -1,0 +1,28 @@
+# Python 가상환경 및 캐시
+.venv/
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 로컬 실행 결과 및 카메라 데이터
+captures/
+*.bag
+*.log
+
+# 로컬에서만 사용하는 설정
+.openai/
+.agents/
+
+# Intel에서 다시 받을 수 있는 공식 실행 도구
+도구/RealSense_공식도구/*.exe
+
+# 운영체제 및 임시 파일
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp

@@ -1,0 +1,1186 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>4축 컨베이어 로봇팔 시뮬레이터</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --panel: #151c31;
+        --line: #26314e;
+        --accent: #48b8ff;
+        --ok: #53df94;
+        --bad: #ff6b76;
+        --belt: #283349;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: #e8edf8;
+        font:
+          14px system-ui,
+          "Malgun Gothic",
+          sans-serif;
+      }
+      header {
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--line);
+      }
+      h1 {
+        font-size: 21px;
+        margin: 0 0 5px;
+      }
+      .sub {
+        color: #9aa8c5;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 330px 1fr;
+        gap: 14px;
+        padding: 14px;
+        min-height: calc(100vh - 83px);
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 15px;
+      }
+      .controls {
+        overflow: auto;
+      }
+      .control {
+        margin: 0 0 15px;
+      }
+      .label {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 6px;
+      }
+      .value {
+        color: var(--accent);
+        font-variant-numeric: tabular-nums;
+      }
+      input[type="range"] {
+        width: 100%;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 7px;
+      }
+      .target {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+      }
+      .target label {
+        color: #9aa8c5;
+        font-size: 11px;
+      }
+      .target input,
+      select {
+        width: 100%;
+        margin-top: 3px;
+        background: #0e1528;
+        color: white;
+        border: 1px solid #34415f;
+        border-radius: 6px;
+        padding: 7px;
+      }
+      button {
+        border: 0;
+        border-radius: 7px;
+        padding: 9px;
+        background: #263552;
+        color: white;
+        cursor: pointer;
+      }
+      button.primary {
+        background: #1677b8;
+      }
+      button.pick {
+        background: #13875a;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: wait;
+      }
+      button:hover {
+        filter: brightness(1.15);
+      }
+      .status {
+        margin-top: 12px;
+        padding: 10px;
+        border-radius: 8px;
+        background: #0e1528;
+        line-height: 1.6;
+      }
+      .motion-status {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        z-index: 10;
+        width: min(520px, 72%);
+        padding: 11px 16px;
+        transform: translate(-50%, -50%);
+        border: 1px solid #4d78ad;
+        border-radius: 10px;
+        background: rgba(10, 22, 42, 0.94);
+        box-shadow: 0 5px 20px rgba(0, 0, 0, 0.45);
+        line-height: 1.5;
+        text-align: center;
+        pointer-events: none;
+      }
+      .motion-status span {
+        display: block;
+        color: #9db7dd;
+        font-size: 12px;
+        margin-bottom: 3px;
+      }
+      .motion-status button {
+        margin-top: 7px;
+        padding: 6px 15px;
+        border: 1px solid #5382ba;
+        background: #24466f;
+        pointer-events: auto;
+      }
+      .contact-result,
+      .preload-result {
+        display: block;
+        margin-top: 4px;
+      }
+      .contact-result {
+        color: #55c2ff;
+      }
+      .preload-result {
+        color: #ffca55;
+      }
+      .ok {
+        color: var(--ok);
+      }
+      .bad {
+        color: var(--bad);
+      }
+      .warn {
+        color: #ffca55;
+      }
+      .note {
+        color: #9aa8c5;
+        font-size: 12px;
+        line-height: 1.45;
+        margin-top: 12px;
+      }
+      .views {
+        position: relative;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .view {
+        position: relative;
+        background: #0d1426;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        overflow: hidden;
+        min-height: 300px;
+      }
+      .view canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .view h2 {
+        position: absolute;
+        z-index: 2;
+        margin: 9px 12px;
+        font-size: 13px;
+        color: #cbd5ea;
+      }
+      .legend {
+        display: flex;
+        gap: 15px;
+        flex-wrap: wrap;
+        color: #aebad2;
+        margin-top: 10px;
+      }
+      .dot:before {
+        content: "";
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 5px;
+        background: var(--c);
+      }
+      @media (max-width: 900px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+        .views {
+          grid-template-columns: 1fr;
+        }
+        .view {
+          height: 330px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>4축 컨베이어 로봇팔 시뮬레이터</h1>
+      <div class="sub">
+        L1 130 · L2 130 · L3 68–76 mm / 엔드이펙터 중심선 왼쪽 오프셋 12 mm / J2
+        높이 51.3 mm / 벨트 기준 작업영역 X -120~+120, 담당 중심 Y 0~+105 mm /
+        벨트 진행 +X
+      </div>
+    </header>
+    <main class="layout">
+      <section class="panel controls">
+        <div id="sliders"></div>
+        <div class="control">
+          <div class="label">
+            <span>벨로우즈 압축</span
+            ><span class="value" id="compressionV"></span>
+          </div>
+          <input
+            id="compression"
+            type="range"
+            min="0"
+            max="8"
+            step="0.1"
+            value="0"
+          />
+        </div>
+        <div class="control">
+          <div class="label"><span>큐브 크기</span></div>
+          <select id="cubeSize">
+            <option value="30">3 cm 정육면체</option>
+            <option value="50">5 cm 정육면체</option>
+          </select>
+        </div>
+        <div class="control">
+          <div class="label"><span>카메라 좌표 (mm)</span></div>
+          <div class="target">
+            <label
+              >Camera X<input
+                id="tx"
+                type="number"
+                step="0.1"
+                value="0.0" /></label
+            ><label
+              >Camera Y<input
+                id="ty"
+                type="number"
+                step="0.1"
+                value="0.0" /></label
+            ><label
+              >Camera Z<input id="tz" type="number" step="0.1" value="0.0"
+            /></label>
+          </div>
+          <div class="note" style="margin-top: 6px">
+            벨트 기준: Camera X=벨트 X(진행), Camera Y=벨트 Y(중앙선 0)<br />Camera
+            Z=0은 벨트 상판이며 큐브 높이는 선택 크기로 반영<br />+Y 쪽 로봇
+            내부 IK: 전방거리=209.5−Camera Y, 측방향=Camera X
+          </div>
+          <button class="primary" id="applyCoords" style="margin-top: 8px">
+            좌표 적용
+          </button>
+        </div>
+        <div class="row">
+          <button class="pick" id="pick">수직 집기</button
+          ><button class="primary" id="alignPick">집기 정렬</button
+          ><button id="loading">로딩 자세</button>
+        </div>
+        <div class="row" style="margin-top: 7px">
+          <button id="release">분류 위치에 놓기</button
+          ><button id="randomize">랜덤 위치</button
+          ><button id="home">기본 자세</button>
+        </div>
+        <div class="status" id="status"></div>
+        <div class="note">
+          J3 실제 자세값은 모터각에 +30° 조립 오프셋을 반영합니다. 문서에 절대
+          회전축 방향이 명시되지 않아, 시뮬레이터는 J3 유효각 90°에서 L1·L2가
+          일직선이 되는 관례를 사용합니다.
+        </div>
+      </section>
+      <section class="panel">
+        <div class="views">
+          <div class="motion-status">
+            <span>현재 수행 동작</span><b id="actionStatus">대기 중</b><br />
+            <button id="pauseResume" disabled>일시정지</button>
+          </div>
+          <div class="view">
+            <h2>3D 등각 보기</h2>
+            <canvas id="iso"></canvas>
+          </div>
+          <div class="view">
+            <h2>윗면 X–Y</h2>
+            <canvas id="top"></canvas>
+          </div>
+          <div class="view">
+            <h2>측면 R–Z</h2>
+            <canvas id="side"></canvas>
+          </div>
+          <div class="view">
+            <h2>정면 X–Z</h2>
+            <canvas id="front"></canvas>
+          </div>
+        </div>
+        <div class="legend">
+          <span class="dot" style="--c: #48b8ff">로봇 링크</span
+          ><span class="dot" style="--c: #53df94">엔드이펙터</span
+          ><span class="dot" style="--c: #ffcc5c">목표 물체</span
+          ><span class="dot" style="--c: #a172ff">이론 작업영역</span>
+        </div>
+      </section>
+    </main>
+    <script>
+      const C = {
+        L1: 130,
+        L2: 130,
+        L3max: 76,
+        H1: 6.3,
+        H2: 51.3,
+        toolLeftOffset: 12,
+        x0: 104.5,
+        x1: 215,
+        y0: -120,
+        y1: 120,
+        edgeMargin: 3,
+        cameraOriginX: 209.5,
+        pickMaxTilt: 15,
+        recoveryMaxTilt: 45,
+        preloadBase: 2,
+        preloadExtraPerDegree: 0.2,
+        preloadMax: 5,
+      };
+      const defs = [
+          ["J1", 0, 180, 0],
+          ["J2", 0, 180, 90],
+          ["J3", 0, 90, 90],
+          ["J4", 0, 180, 90],
+        ],
+        state = {};
+      let held = false,
+        busy = false,
+        simulationPaused = false,
+        currentAction = { ok: true, msg: "대기 중" },
+        appliedCamera = { x: 0, y: 0, z: 0, size: 30 };
+      const sliders = document.getElementById("sliders"),
+        statusEl = document.getElementById("status"),
+        actionStatusEl = document.getElementById("actionStatus"),
+        pauseResumeBtn = document.getElementById("pauseResume");
+      for (const [n, min, max, v] of defs) {
+        state[n] = v;
+        const d = document.createElement("div");
+        d.className = "control";
+        d.innerHTML = `<div class="label"><span>${n}${n === "J3" ? " 모터각" : ""}</span><span class="value" id="${n}V"></span></div><input id="${n}" type="range" min="${min}" max="${max}" step="0.5" value="${v}">`;
+        sliders.appendChild(d);
+        d.querySelector("input").oninput = (e) => {
+          state[n] = +e.target.value;
+          draw();
+        };
+      }
+      const rad = (d) => (d * Math.PI) / 180,
+        clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+      function fk(s = state) {
+        const a1 = s.J2,
+          effective = s.J3 + 30,
+          a2 = a1 - 60 - s.J3,
+          a3 = a2 + (s.J4 - 90),
+          /* Physical J1 convention: 90 deg=front, 0 deg=robot-left. */
+          yaw = rad(90 - s.J1),
+          L3 = C.L3max - +compression.value;
+        let r1 = C.L1 * Math.cos(rad(a1)),
+          z1 = C.H2 + C.L1 * Math.sin(rad(a1));
+        let r2 = r1 + C.L2 * Math.cos(rad(a2)),
+          z2 = z1 + C.L2 * Math.sin(rad(a2));
+        let r3 = r2 + L3 * Math.cos(rad(a3)),
+          z3 = z2 + L3 * Math.sin(rad(a3));
+        const cv = (r, z) => ({
+          x: r * Math.cos(yaw),
+          y: r * Math.sin(yaw),
+          z,
+        });
+        const radialTip = cv(r3, z3),
+          toolTip = {
+            x: radialTip.x - C.toolLeftOffset * Math.sin(yaw),
+            y: radialTip.y + C.toolLeftOffset * Math.cos(yaw),
+            z: radialTip.z,
+          };
+        return {
+          p: [
+            { x: 0, y: 0, z: C.H2 },
+            cv(r1, z1),
+            cv(r2, z2),
+            radialTip,
+            toolTip,
+          ],
+          a1,
+          a2,
+          a3,
+          effective,
+          L3,
+        };
+      }
+      function findIK(x, y, z, comp = +compression.value, maxTilt = 0) {
+        const targetRadius = Math.hypot(x, y);
+        if (targetRadius < C.toolLeftOffset) return null;
+        const r = Math.sqrt(
+            targetRadius * targetRadius - C.toolLeftOffset * C.toolLeftOffset,
+          ),
+          yaw = Math.atan2(y, x) - Math.atan2(C.toolLeftOffset, r),
+          j1 = 90 - (yaw * 180) / Math.PI;
+        if (j1 < 0 || j1 > 180) return null;
+        let best = null;
+        const tilts = [0];
+        for (let a = 0.5; a <= maxTilt; a += 0.5) tilts.push(a, -a);
+        for (const tilt of tilts) {
+          let bestAtTilt = null;
+          for (let j2 = 0; j2 <= 180; j2 += 0.5)
+            for (let j3 = 0; j3 <= 90; j3 += 0.5) {
+              const a2 = j2 - 60 - j3,
+                j4 = tilt - a2;
+              if (j4 < 0 || j4 > 180) continue;
+              const a3 = -90 + tilt,
+                L3 = C.L3max - comp,
+                rr =
+                  C.L1 * Math.cos(rad(j2)) +
+                  C.L2 * Math.cos(rad(a2)) +
+                  L3 * Math.cos(rad(a3)),
+                zz =
+                  C.H2 +
+                  C.L1 * Math.sin(rad(j2)) +
+                  C.L2 * Math.sin(rad(a2)) +
+                  L3 * Math.sin(rad(a3)),
+                dist = Math.hypot(rr - r, zz - z),
+                candidate = { J1: j1, J2: j2, J3: j3, J4: j4, dist, tilt };
+              if (!bestAtTilt || dist < bestAtTilt.dist) bestAtTilt = candidate;
+              if (!best || dist < best.dist) best = candidate;
+            }
+          if (bestAtTilt && bestAtTilt.dist <= 3) return bestAtTilt;
+        }
+        return best;
+      }
+      function preloadForTilt(tilt) {
+        return Math.min(
+          C.preloadMax,
+          C.preloadBase + Math.abs(tilt || 0) * C.preloadExtraPerDegree,
+        );
+      }
+      function findPreloadIK(x, y, z) {
+        let comp = C.preloadBase,
+          pose = findIK(x, y, z, comp, C.pickMaxTilt);
+        for (let i = 0; i < 2 && pose; i++) {
+          const adjusted = preloadForTilt(pose.tilt);
+          if (Math.abs(adjusted - comp) < 0.01) break;
+          comp = adjusted;
+          pose = findIK(x, y, z, comp, C.pickMaxTilt);
+        }
+        return { pose, comp };
+      }
+      function cameraToRobot(xMm, yMm, zMm, size) {
+        return {
+          x: C.cameraOriginX - yMm,
+          y: xMm,
+          top: zMm > 0 ? zMm : size,
+          size,
+        };
+      }
+      function cameraTarget() {
+        return cameraToRobot(
+          appliedCamera.x,
+          appliedCamera.y,
+          appliedCamera.z,
+          appliedCamera.size,
+        );
+      }
+      function applyCameraInputs(notify = true) {
+        const x = Number(tx.value),
+          y = Number(ty.value),
+          z = Number(tz.value),
+          size = Number(cubeSize.value);
+        if (![x, y, z, size].every(Number.isFinite)) {
+          show(false, "카메라 좌표에 올바른 숫자를 입력하세요.");
+          return false;
+        }
+        appliedCamera = { x, y, z, size };
+        held = false;
+        compression.value = 0;
+        draw();
+        if (notify)
+          show(
+            true,
+            `좌표 적용 완료 · Camera (${x.toFixed(1)}, ${y.toFixed(1)}, ${z.toFixed(1)}) mm`,
+          );
+        return true;
+      }
+      function setCameraObject(obj) {
+        const z = Number(obj.robot_z_mm ?? 0),
+          size = Math.abs(z - 50) < Math.abs(z - 30) ? 50 : 30;
+        cubeSize.value = String(size);
+        tx.value = Number(obj.robot_x_mm ?? 0).toFixed(1);
+        ty.value = Number(obj.robot_y_mm ?? 0).toFixed(1);
+        tz.value = z.toFixed(1);
+        applyCameraInputs(false);
+      }
+      window.setCameraObject = setCameraObject;
+      function cubeInsideWorkspace(t = cameraTarget()) {
+        const h = t.size / 2,
+          beltX = t.y,
+          beltY = C.cameraOriginX - t.x,
+          positiveYOuter = C.cameraOriginX - C.x0;
+        return (
+          beltY >= 0 &&
+          beltY + h <= positiveYOuter &&
+          beltX - h >= C.y0 &&
+          beltX + h <= C.y1
+        );
+      }
+      function cubeInsidePreferredWorkspace(t = cameraTarget()) {
+        const h = t.size / 2,
+          m = C.edgeMargin,
+          beltX = t.y,
+          beltY = C.cameraOriginX - t.x,
+          positiveYOuter = C.cameraOriginX - C.x0;
+        return (
+          beltY >= 0 &&
+          beltY + h < positiveYOuter - m &&
+          beltX - h > C.y0 + m &&
+          beltX + h < C.y1 - m
+        );
+      }
+      function alignForPick() {
+        const t = cameraTarget();
+        if (!cubeInsideWorkspace(t))
+          return show(
+            false,
+            "큐브 중심 Y가 음수이면 반대편 로봇 담당이며, 나머지 큐브 영역은 작업영역 안쪽이어야 합니다.",
+          );
+        const contactPose = findIK(t.x, t.y, t.top, 0, C.pickMaxTilt),
+          preloadSolution = findPreloadIK(t.x, t.y, t.top),
+          preloadComp = preloadSolution.comp,
+          preloadPose = preloadSolution.pose;
+        if (
+          !contactPose ||
+          !preloadPose ||
+          Math.max(
+            contactPose?.dist ?? Infinity,
+            preloadPose?.dist ?? Infinity,
+          ) > 3
+        )
+          return show(
+            false,
+            "접촉 또는 기울기 보정 예압 자세를 만들 수 없습니다.",
+          );
+        held = false;
+        compression.value = 0;
+        Object.assign(state, contactPose);
+        sync();
+        show(
+          true,
+          `집기 정렬 완료 · Robot (${t.x.toFixed(1)}, ${t.y.toFixed(1)}, ${t.top.toFixed(1)}) mm` +
+            `<span class="contact-result">접촉 자세 · 기울기 ${contactPose.tilt.toFixed(1)}° — J1 ${contactPose.J1.toFixed(1)}° / J2 ${contactPose.J2.toFixed(1)}° / J3 ${contactPose.J3.toFixed(1)}° / J4 ${contactPose.J4.toFixed(1)}°</span>` +
+            `<span class="preload-result">흡착 자세 · 예압 ${preloadComp.toFixed(1)} mm · 기울기 ${preloadPose.tilt.toFixed(1)}° — J1 ${preloadPose.J1.toFixed(1)}° / J2 ${preloadPose.J2.toFixed(1)}° / J3 ${preloadPose.J3.toFixed(1)}° / J4 ${preloadPose.J4.toFixed(1)}°</span>`,
+        );
+        draw();
+      }
+      async function loadingPose() {
+        if (busy) return;
+        busy = true;
+        simulationPaused = false;
+        pauseResumeBtn.disabled = false;
+        pauseResumeBtn.textContent = "일시정지";
+        for (const b of [pick, alignPick, loading, release, randomize, home])
+          b.disabled = true;
+        const comp = held ? 8 : 0;
+        try {
+          show(true, "로딩 정렬 1/3 · J1 유지 · J2/J3를 120°/56°로 이동 중");
+          await tweenTo({ ...state, J2: 120, J3: 56 }, comp, 1400);
+          show(true, "로딩 정렬 2/3 · J4를 0°로 이동 중");
+          await tweenTo({ ...state, J4: 0 }, comp, 1100);
+          show(true, "로딩 정렬 3/3 · J1을 마지막으로 정면 90° 이동 중");
+          await tweenTo({ ...state, J1: 90 }, comp, 1100);
+          show(true, "로딩 자세 정렬 완료 · J1 90° / J2 120° / J3 56° / J4 0°");
+        } finally {
+          busy = false;
+          simulationPaused = false;
+          pauseResumeBtn.disabled = true;
+          pauseResumeBtn.textContent = "일시정지";
+          for (const b of [pick, alignPick, loading, release, randomize, home])
+            b.disabled = false;
+          draw();
+        }
+      }
+      function tweenTo(goal, comp, ms = 1300) {
+        return new Promise((resolve) => {
+          const from = { ...state },
+            c0 = +compression.value;
+          let elapsed = 0,
+            lastTime = performance.now();
+          function step(t) {
+            if (!simulationPaused) elapsed += t - lastTime;
+            lastTime = t;
+            const q = Math.min(1, elapsed / ms),
+              e = q * q * (3 - 2 * q);
+            for (const n of ["J1", "J2", "J3", "J4"])
+              state[n] = from[n] + (goal[n] - from[n]) * e;
+            compression.value = c0 + (comp - c0) * e;
+            draw();
+            if (q < 1) requestAnimationFrame(step);
+            else resolve();
+          }
+          requestAnimationFrame(step);
+        });
+      }
+      async function pickCube() {
+        if (busy) return;
+        const t = cameraTarget();
+        if (!cubeInsideWorkspace(t))
+          return show(
+            false,
+            "큐브 중심 Y가 음수이면 반대편 로봇 담당입니다. X 방향과 +Y 바깥쪽 경계도 확인하세요.",
+          );
+        busy = true;
+        simulationPaused = false;
+        pauseResumeBtn.disabled = false;
+        pauseResumeBtn.textContent = "일시정지";
+        for (const b of [pick, alignPick, loading]) b.disabled = true;
+        held = false;
+        const x = t.x,
+          y = t.y,
+          top = t.top,
+          load = { ...state, J1: 90, J2: 120, J3: 56, J4: 0 };
+        try {
+          const approach = findIK(x, y, top + 10, 0, C.pickMaxTilt),
+            contact = findIK(x, y, top, 0, C.pickMaxTilt),
+            preloadSolution = findPreloadIK(x, y, top),
+            preloadComp = preloadSolution.comp,
+            preloaded = preloadSolution.pose,
+            lift = findIK(x, y, top + 16, 8, C.recoveryMaxTilt);
+          if (
+            !approach ||
+            !contact ||
+            !preloaded ||
+            !lift ||
+            Math.max(approach.dist, contact.dist, preloaded.dist, lift.dist) > 3
+          )
+            throw Error(
+              "현재 카메라 좌표는 최대 15° 기울기 조건에서도 집기 범위 밖입니다.",
+            );
+          show(true, "1/9 로딩 진입 1/3 · J1 유지 · J2/J3 먼저 이동 중");
+          await tweenTo({ ...state, J2: 120, J3: 56 }, 0, 1400);
+          show(true, "1/9 로딩 진입 2/3 · J4를 0°로 이동 중");
+          await tweenTo({ ...state, J4: 0 }, 0, 1100);
+          show(true, "1/9 로딩 진입 3/3 · J1을 마지막으로 정면 90° 이동 중");
+          await tweenTo(load, 0, 1100);
+          const aimJ1 = { ...load, J1: approach.J1 };
+          show(
+            true,
+            "2/9 로딩 자세 유지 · J1을 목표 큐브 방향으로 먼저 회전 중",
+          );
+          await tweenTo(aimJ1, 0, 900);
+          show(
+            true,
+            `3/9 J1 고정 · 최소 기울기 ${approach.tilt.toFixed(1)}°로 상부 10 mm 접근 중`,
+          );
+          await tweenTo(approach, 0);
+          show(true, `4/9 기울기 ${contact.tilt.toFixed(1)}°로 상판에 접촉 중`);
+          await tweenTo(contact, 0);
+          show(
+            true,
+            `5/9 기울기 보정 예압 ${preloadComp.toFixed(1)} mm 적용 중`,
+          );
+          await tweenTo(preloaded, preloadComp, 1100);
+          held = true;
+          show(
+            true,
+            `6/9 조인트 정지 · 벨로우즈가 ${(8 - preloadComp).toFixed(1)} mm 수동 수축 중`,
+          );
+          await tweenTo(preloaded, 8, 1400);
+          show(
+            true,
+            `7/9 흡착 확인 · 기울기 ${lift.tilt.toFixed(1)}°로 총 16 mm 높이 확보 중`,
+          );
+          await tweenTo(lift, 8, 1700);
+          const loadWithoutJ1 = { ...load, J1: lift.J1 };
+          show(true, "8/9 J1 유지 · J2·J3·J4 먼저 로딩 자세로 회수 중");
+          await tweenTo(loadWithoutJ1, 8, 1400);
+          show(true, "9/9 높이 확보 완료 · J1을 마지막으로 90° 회전 중");
+          await tweenTo(load, 8, 900);
+          show(
+            true,
+            `${t.size / 10} cm 큐브 집기 완료 · 최대 집기 기울기 ${Math.max(Math.abs(approach.tilt), Math.abs(contact.tilt), Math.abs(preloaded.tilt)).toFixed(1)}° · 예압 ${preloadComp.toFixed(1)} mm · J1 마지막 회전`,
+          );
+        } catch (e) {
+          show(false, e.message);
+        } finally {
+          busy = false;
+          simulationPaused = false;
+          pauseResumeBtn.disabled = true;
+          pauseResumeBtn.textContent = "일시정지";
+          for (const b of [pick, alignPick, loading]) b.disabled = false;
+          draw();
+        }
+      }
+      async function placeSortedCube() {
+        if (busy) return;
+        if (!held)
+          return show(
+            false,
+            "먼저 큐브를 집어야 분류 위치에 놓을 수 있습니다.",
+          );
+
+        busy = true;
+        simulationPaused = false;
+        pauseResumeBtn.disabled = false;
+        pauseResumeBtn.textContent = "일시정지";
+        for (const b of [pick, alignPick, loading, release, randomize, home])
+          b.disabled = true;
+
+        const size = cameraTarget().size,
+          targetJ1 = size === 30 ? 0 : 180,
+          sideName = size === 30 ? "왼쪽" : "오른쪽",
+          load = { J1: 90, J2: 120, J3: 56, J4: 0 },
+          aimedLoad = { ...load, J1: targetJ1 },
+          place = { J1: targetJ1, J2: 60, J3: 30, J4: 60 };
+
+        try {
+          show(true, `1/12 ${size / 10} cm 큐브 · 로딩 자세에서 2초 대기 중`);
+          await tweenTo(load, 8, 700);
+          await tweenTo(load, 8, 2000);
+
+          show(
+            true,
+            `2/12 ${sideName} 분류 위치로 J1 먼저 ${targetJ1}° 회전 중`,
+          );
+          await tweenTo(aimedLoad, 8, 1200);
+
+          show(true, "3/12 J1 고정 · J2/J3/J4를 60°/30°/60°로 이동 중");
+          await tweenTo(place, 8, 1600);
+
+          show(true, "4/12 놓기 자세 도착 · 공압 유지 상태로 2초 대기 중");
+          await tweenTo(place, 8, 2000);
+
+          show(
+            true,
+            `5/12 공압 OFF · ${sideName}에 ${size / 10} cm 큐브 놓는 중`,
+          );
+          const tip = fk().p.at(-1);
+          appliedCamera = {
+            x: tip.y,
+            y: C.cameraOriginX - tip.x,
+            z: 0,
+            size,
+          };
+          tx.value = appliedCamera.x.toFixed(1);
+          ty.value = appliedCamera.y.toFixed(1);
+          tz.value = "0.0";
+          compression.value = 0;
+          held = false;
+          draw();
+          await tweenTo(place, 0, 300);
+
+          show(true, "6/12 공압 OFF 및 큐브 분리 완료 · 2초 대기 중");
+          await tweenTo(place, 0, 2000);
+
+          const returnWithoutJ1 = { ...load, J1: targetJ1 };
+          show(true, "7/12 J1 유지 · J2/J3/J4부터 로딩 각도로 복귀 중");
+          await tweenTo(returnWithoutJ1, 0, 1600);
+
+          show(true, "8/12 J2/J3/J4 로딩 정렬 완료 · J1 마지막 복귀 중");
+          await tweenTo(load, 0, 1200);
+
+          show(
+            true,
+            `9/12 ${size / 10} cm 큐브 ${sideName} 분류 완료 · 로딩 자세에서 2초 대기 중`,
+          );
+          await tweenTo(load, 0, 2000);
+
+          const safeJ1 = { ...load, J1: 0 };
+          show(true, "10/12 안전 복귀 · J1을 먼저 왼쪽 0°로 회전 중");
+          await tweenTo(safeJ1, 0, 1200);
+
+          const safeJ4 = { ...safeJ1, J4: 90 };
+          show(true, "11/12 안전 복귀 · J4를 두 번째로 90° 이동 중");
+          await tweenTo(safeJ4, 0, 1200);
+
+          const safeHome = { J1: 0, J2: 90, J3: 90, J4: 90 };
+          show(true, "12/12 안전 복귀 · J2/J3를 마지막으로 90° 정렬 중");
+          await tweenTo(safeHome, 0, 1400);
+          show(
+            true,
+            `${size / 10} cm 큐브 ${sideName} 분류 완료 · 안전 기본 자세 0/90/90/90`,
+          );
+        } catch (e) {
+          show(false, e.message);
+        } finally {
+          busy = false;
+          simulationPaused = false;
+          pauseResumeBtn.disabled = true;
+          pauseResumeBtn.textContent = "일시정지";
+          for (const b of [pick, alignPick, loading, release, randomize, home])
+            b.disabled = false;
+          draw();
+        }
+      }
+      function sync() {
+        for (const [n] of defs) {
+          document.getElementById(n).value = state[n];
+          document.getElementById(n + "V").textContent =
+            state[n].toFixed(1) + "°";
+        }
+        compressionV.textContent = (+compression.value).toFixed(1) + " mm";
+      }
+      function show(ok, msg) {
+        currentAction = { ok, msg };
+        renderActionStatus();
+      }
+      function renderActionStatus() {
+        actionStatusEl.innerHTML = `<b class="${currentAction.ok ? "ok" : "bad"}">${currentAction.msg}</b>`;
+      }
+      function setup(id) {
+        const c = document.getElementById(id),
+          d = devicePixelRatio || 1,
+          w = c.clientWidth,
+          h = c.clientHeight;
+        if (c.width !== w * d || c.height !== h * d) {
+          c.width = w * d;
+          c.height = h * d;
+        }
+        const g = c.getContext("2d");
+        g.setTransform(d, 0, 0, d, 0, 0);
+        g.clearRect(0, 0, w, h);
+        return { g, w, h };
+      }
+      function mapper(w, h, xmin, xmax, ymin, ymax) {
+        const p = 34,
+          k = Math.min(
+            (w - 2 * p) / (xmax - xmin),
+            (h - 2 * p) / (ymax - ymin),
+          );
+        return (x, y) => [p + (x - xmin) * k, h - p - (y - ymin) * k];
+      }
+      function grid(g, w, h, m, xmin, xmax, ymin, ymax) {
+        g.strokeStyle = "#202b44";
+        g.lineWidth = 1;
+        for (let x = Math.ceil(xmin / 50) * 50; x <= xmax; x += 50) {
+          let [a] = m(x, 0);
+          g.beginPath();
+          g.moveTo(a, 25);
+          g.lineTo(a, h - 25);
+          g.stroke();
+        }
+        for (let y = Math.ceil(ymin / 50) * 50; y <= ymax; y += 50) {
+          let [, b] = m(0, y);
+          g.beginPath();
+          g.moveTo(25, b);
+          g.lineTo(w - 25, b);
+          g.stroke();
+        }
+      }
+      function line(g, m, pts, axes) {
+        g.lineCap = "round";
+        g.lineJoin = "round";
+        g.strokeStyle = "#48b8ff";
+        g.lineWidth = 7;
+        g.beginPath();
+        pts.forEach((p, i) => {
+          let q = m(p[axes[0]], p[axes[1]]);
+          i ? g.lineTo(...q) : g.moveTo(...q);
+        });
+        g.stroke();
+        g.strokeStyle = "#53df94";
+        g.lineWidth = 5;
+        let a = m(pts[2][axes[0]], pts[2][axes[1]]),
+          b = m(pts[3][axes[0]], pts[3][axes[1]]),
+          c = pts[4] ? m(pts[4][axes[0]], pts[4][axes[1]]) : null;
+        g.beginPath();
+        g.moveTo(...a);
+        g.lineTo(...b);
+        if (c) g.lineTo(...c);
+        g.stroke();
+        for (const p of pts) {
+          let q = m(p[axes[0]], p[axes[1]]);
+          g.fillStyle = "#e8edf8";
+          g.beginPath();
+          g.arc(...q, 5, 0, 7);
+          g.fill();
+        }
+      }
+      function cubeCenter() {
+        const t = cameraTarget(),
+          size = t.size;
+        if (held) {
+          const points = fk().p,
+            tip = points[points.length - 1];
+          return { x: tip.x, y: tip.y, z: tip.z - size / 2, size };
+        }
+        return { x: t.x, y: t.y, z: size / 2, size };
+      }
+      function drawCube(g, m, a, b, size, lifted = false) {
+        const q = m(a, b),
+          e = m(a + size / 2, b),
+          px = Math.max(5, Math.abs(e[0] - q[0]));
+        g.fillStyle = lifted ? "rgba(79,221,145,.92)" : "rgba(255,204,92,.88)";
+        g.strokeStyle = lifted ? "#b4ffd6" : "#ffe29a";
+        g.lineWidth = 1.5;
+        g.fillRect(q[0] - px, q[1] - px, px * 2, px * 2);
+        g.strokeRect(q[0] - px, q[1] - px, px * 2, px * 2);
+      }
+      function conveyor(g, m, kind) {
+        g.fillStyle = "#424a78";
+        if (kind === "top") {
+          const beltY0 = C.cameraOriginX - C.x1,
+            beltY1 = C.cameraOriginX - C.x0;
+          let a = m(C.y0, beltY1),
+            b = m(C.y1, beltY0);
+          g.fillRect(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+          g.strokeStyle = "#465674";
+          for (let x = C.y0; x <= C.y1; x += 40) {
+            let p = m(x, beltY0),
+              q = m(x, beltY1);
+            g.beginPath();
+            g.moveTo(...p);
+            g.lineTo(...q);
+            g.stroke();
+          }
+          const beltCenterY = (beltY0 + beltY1) / 2,
+            p = m(-70, beltCenterY),
+            q = m(70, beltCenterY);
+          g.strokeStyle = "#ffffff";
+          g.fillStyle = "#ffffff";
+          g.lineWidth = 4;
+          g.beginPath();
+          g.moveTo(...p);
+          g.lineTo(...q);
+          g.stroke();
+          g.beginPath();
+          g.moveTo(q[0], q[1]);
+          g.lineTo(q[0] - 8, q[1] + 14);
+          g.lineTo(q[0] + 8, q[1] + 14);
+          g.closePath();
+          g.fill();
+          g.font = "bold 11px system-ui";
+          g.fillText("+X 벨트 진행", q[0] + 12, q[1] + 5);
+        } else if (kind === "side") {
+          let a = m(C.x0, 0),
+            b = m(C.x1, -12);
+          g.fillRect(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+          g.strokeStyle = "#9578ee";
+          g.lineWidth = 2;
+          g.strokeRect(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+          g.fillStyle = "#c8d1e8";
+          g.font = "bold 11px system-ui";
+          g.fillText("벨트 상판 Z=0", a[0] + 8, a[1] - 8);
+        } else if (kind === "front") {
+          let a = m(C.y0, 0),
+            b = m(C.y1, -12);
+          g.fillRect(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+          g.strokeStyle = "#9578ee";
+          g.lineWidth = 2;
+          g.strokeRect(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+          const center = m(0, 0);
+          g.strokeStyle = "#ffffff";
+          g.lineWidth = 2;
+          g.beginPath();
+          g.moveTo(center[0], center[1] - 7);
+          g.lineTo(center[0], center[1] + 12);
+          g.stroke();
+          g.fillStyle = "#c8d1e8";
+          g.font = "bold 11px system-ui";
+          g.fillText("벨트 X=0", center[0] + 8, center[1] - 8);
+        }
+      }
+      function draw2(id, axes, bounds, kind) {
+        const { g, w, h } = setup(id),
+          m = mapper(w, h, ...bounds);
+        grid(g, w, h, m, ...bounds);
+        conveyor(g, m, kind);
+        if (kind === "top") {
+          g.fillStyle = "rgba(161,114,255,.18)";
+          const beltY1 = C.cameraOriginX - C.x0;
+          let a = m(C.y0, beltY1),
+            b = m(C.y1, 0);
+          g.fillRect(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+        }
+        let p = fk().p,
+          c = cubeCenter();
+        if (kind === "top") {
+          p = p.map((q) => ({ x: q.y, y: C.cameraOriginX - q.x, z: q.z }));
+          c = { ...c, x: c.y, y: C.cameraOriginX - c.x };
+        }
+        line(g, m, p, axes);
+        const lifted = held && c.z - c.size / 2 > 0.5;
+        drawCube(g, m, c[axes[0]], c[axes[1]], c.size, lifted);
+      }
+      function drawIso() {
+        const { g, w, h } = setup("iso"),
+          m = mapper(w, h, -270, 300, -100, 380),
+          proj = (p) => ({
+            u: p.x * 0.82 + p.y * 0.55,
+            v: p.z - p.x * 0.18 + p.y * 0.18,
+          }),
+          P = fk().p.map(proj);
+        g.strokeStyle = "#26314e";
+        for (let i = -300; i <= 300; i += 50) {
+          let a = m(i * 0.82 + -300 * 0.55, -i * 0.18 + -300 * 0.18),
+            b = m(i * 0.82 + 300 * 0.55, -i * 0.18 + 300 * 0.18);
+          g.beginPath();
+          g.moveTo(...a);
+          g.lineTo(...b);
+          g.stroke();
+        }
+        const beltCorners = [
+          { x: C.x0, y: C.y0, z: 0 },
+          { x: C.x1, y: C.y0, z: 0 },
+          { x: C.x1, y: C.y1, z: 0 },
+          { x: C.x0, y: C.y1, z: 0 },
+        ]
+          .map(proj)
+          .map((q) => m(q.u, q.v));
+        g.fillStyle = "rgba(66,74,120,.82)";
+        g.strokeStyle = "#9578ee";
+        g.lineWidth = 2;
+        g.beginPath();
+        beltCorners.forEach((q, i) => (i ? g.lineTo(...q) : g.moveTo(...q)));
+        g.closePath();
+        g.fill();
+        g.stroke();
+        for (let y = C.y0 + 40; y < C.y1; y += 40) {
+          const a = proj({ x: C.x0, y, z: 1 }),
+            b = proj({ x: C.x1, y, z: 1 }),
+            ap = m(a.u, a.v),
+            bp = m(b.u, b.v);
+          g.strokeStyle = "rgba(190,200,230,.32)";
+          g.lineWidth = 1;
+          g.beginPath();
+          g.moveTo(...ap);
+          g.lineTo(...bp);
+          g.stroke();
+        }
+        const arrowA = proj({ x: (C.x0 + C.x1) / 2, y: -55, z: 3 }),
+          arrowB = proj({ x: (C.x0 + C.x1) / 2, y: 55, z: 3 }),
+          aa = m(arrowA.u, arrowA.v),
+          ab = m(arrowB.u, arrowB.v);
+        g.strokeStyle = "#ffffff";
+        g.fillStyle = "#ffffff";
+        g.lineWidth = 3;
+        g.beginPath();
+        g.moveTo(...aa);
+        g.lineTo(...ab);
+        g.stroke();
+        const ang = Math.atan2(ab[1] - aa[1], ab[0] - aa[0]);
+        g.beginPath();
+        g.moveTo(...ab);
+        g.lineTo(
+          ab[0] - 12 * Math.cos(ang - 0.55),
+          ab[1] - 12 * Math.sin(ang - 0.55),
+        );
+        g.lineTo(
+          ab[0] - 12 * Math.cos(ang + 0.55),
+          ab[1] - 12 * Math.sin(ang + 0.55),
+        );
+        g.closePath();
+        g.fill();
+        line(
+          g,
+          m,
+          P.map((q) => ({ u: q.u, v: q.v })),
+          ["u", "v"],
+        );
+        const c = cubeCenter(),
+          t = proj(c);
+        const lifted = held && c.z - c.size / 2 > 0.5;
+        drawCube(g, m, t.u, t.v, c.size * 0.7, lifted);
+      }
+      function draw() {
+        sync();
+        const p = fk(),
+          tip = p.p[p.p.length - 1],
+          objectInside = cubeInsideWorkspace(),
+          objectPreferred = cubeInsidePreferredWorkspace(),
+          assignment =
+            appliedCamera.y < 0
+              ? "중심 Y<0 · 반대편 로봇 담당"
+              : "큐브가 작업영역 경계에 닿거나 외부";
+        statusEl.innerHTML = `끝단(내부 IK): 전방 ${tip.x.toFixed(1)}, 측방향 ${tip.y.toFixed(1)}, Z ${tip.z.toFixed(1)} mm<br>J3 유효각: ${p.effective.toFixed(1)}° · 끝단 기울기: ${(p.a3 + 90).toFixed(1)}° · L3: ${p.L3.toFixed(1)} mm<br><span class="${held ? "ok" : !objectInside ? "bad" : objectPreferred ? "ok" : "warn"}">${held ? "큐브 흡착 상태" : !objectInside ? assignment : objectPreferred ? "중심 Y≥0 · +Y 쪽 로봇 담당" : "실제 경계 내부 · 3 mm 여유선 근접 · 피킹 허용"}</span>`;
+        drawIso();
+        draw2("top", ["x", "y"], [-280, 280, -250, 250], "top");
+        draw2("side", ["x", "z"], [-80, 360, -120, 360], "side");
+        draw2("front", ["y", "z"], [-280, 280, -120, 360], "front");
+      }
+      pick.onclick = pickCube;
+      pauseResumeBtn.onclick = () => {
+        if (!busy) return;
+        simulationPaused = !simulationPaused;
+        pauseResumeBtn.textContent = simulationPaused ? "재생" : "일시정지";
+        renderActionStatus();
+      };
+      alignPick.onclick = alignForPick;
+      loading.onclick = loadingPose;
+      applyCoords.onclick = () => applyCameraInputs(true);
+      release.onclick = placeSortedCube;
+      randomize.onclick = () => {
+        const s = +cubeSize.value,
+          h = s / 2,
+          m = C.edgeMargin + 1,
+          beltX = C.y0 + h + m + Math.random() * (C.y1 - C.y0 - s - 2 * m),
+          positiveYOuter = C.cameraOriginX - C.x0,
+          beltY = Math.random() * (positiveYOuter - h - m);
+        tx.value = beltX.toFixed(1);
+        ty.value = beltY.toFixed(1);
+        tz.value = s.toFixed(1);
+        applyCameraInputs(false);
+        show(
+          true,
+          `경계 안쪽 랜덤 배치 · Camera (${tx.value}, ${ty.value}, ${tz.value}) mm`,
+        );
+      };
+      home.onclick = async () => {
+        if (busy) return;
+        busy = true;
+        simulationPaused = false;
+        pauseResumeBtn.disabled = false;
+        pauseResumeBtn.textContent = "일시정지";
+        for (const b of [pick, alignPick, loading, release, randomize, home])
+          b.disabled = true;
+        held = false;
+        compression.value = 0;
+        try {
+          show(true, "안전 복귀 1/3 · J1을 먼저 왼쪽 0°로 회전 중");
+          await tweenTo({ ...state, J1: 0 }, 0, 1200);
+          show(true, "안전 복귀 2/3 · J4를 두 번째로 90° 이동 중");
+          await tweenTo({ ...state, J4: 90 }, 0, 1200);
+          show(true, "안전 복귀 3/3 · J2/J3를 마지막으로 90° 정렬 중");
+          await tweenTo({ J1: 0, J2: 90, J3: 90, J4: 90 }, 0, 1400);
+          show(true, "안전 기본 자세 완료 · J1 0° / J2 90° / J3 90° / J4 90°");
+        } finally {
+          busy = false;
+          simulationPaused = false;
+          pauseResumeBtn.disabled = true;
+          pauseResumeBtn.textContent = "일시정지";
+          for (const b of [pick, alignPick, loading, release, randomize, home])
+            b.disabled = false;
+          draw();
+        }
+      };
+      compression.oninput = draw;
+      for (const e of [tx, ty, tz, cubeSize]) {
+        e.onchange = () => {
+          if (e !== cubeSize && e.value.includes("."))
+            e.value = (+e.value).toFixed(1);
+        };
+      }
+      window.onresize = draw;
+      sync();
+      draw();
+    </script>
+  </body>
+</html>
