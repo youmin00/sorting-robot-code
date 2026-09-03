@@ -16,11 +16,9 @@ Controls:
 from __future__ import annotations
 
 import argparse
-import copy
 import os
 import time
 import serial
-from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -42,12 +40,48 @@ except ImportError:
     ImageDraw = None
     ImageFont = None
 
+from sorting_robot.arm_protocol import (
+    ARM_SERIAL_BYTE_DELAY_SEC,
+    build_dual_arm_line as _build_dual_arm_line,
+    build_single_arm_line as _build_single_arm_line,
+    write_arm_line,
+)
+from sorting_robot.camera_config import CameraConfig
+from sorting_robot.arm_planning import (
+    CENTER_SIMULTANEOUS_MIN_X_GAP_MM,
+    ROBOT_FORWARD_TO_CENTER_MM,
+    ROBOT_IK_TOLERANCE_MM,
+    ROBOT_J2_HEIGHT_MM,
+    ROBOT_L1_MM,
+    ROBOT_L2_MM,
+    ROBOT_L3_MM,
+    ROBOT_TOOL_LEFT_OFFSET_MM,
+    _ARM_PLAN_CACHE,
+    _arm_ik,
+    build_arm_pick_plan,
+    center_priority_side,
+    choose_pipeline_plans,
+    object_in_left_workspace,
+    object_in_right_workspace,
+    plan_in_center_risk_zone,
+)
+from sorting_robot.vision_display import depth_to_colormap
+from sorting_robot.vision_geometry import (
+    align_quad_to_reference,
+    candidate_slot_key,
+    inset_quad,
+    intersect_parametric_lines,
+    is_rectangular_quad,
+    order_quad_points,
+    quad_mask_roi,
+    quad_iou,
+)
+
 MAX_TRACKED_OBJECTS = 8
 
 STM32_PORT = "COM4"
 STM32_BAUD = 115200
 AUTO_START_CONVEYOR = False
-AUTO_REPLY_EMPTY = True
 
 CAMERA_SETTLE_SEC = 1.2
 CAMERA_SETTLE_FRAMES = 6
@@ -55,15 +89,9 @@ CAMERA_INITIAL_EMPTY_GRACE_SEC = 1.0
 CAMERA_REACQUIRE_MAX_SEC = 0.8
 CAMERA_REACQUIRE_STABLE_FRAMES = 5
 CAMERA_STABLE_POSITION_TOLERANCE_MM = 2.0
-ARM_PLAN_CACHE_GRID_MM = 2.0
-ARM_PLAN_CACHE_MAX_ENTRIES = 256
 
 EMPTY_CONFIRM_FRAMES = 8
-OBJECT_REMOVED_CONFIRM_FRAMES = 12
-MULTI_OBJECT_MISSING_CONFIRM_FRAMES = 24
-OBJECT_RECHECK_SEC = 0.3
 OBJECT_SLOT_MATCH_PX = 65
-OBJECT_REMOVED_MATCH_PX = 65
 
 ROBOT_X_SCALE = 0.907
 ROBOT_Y_SCALE = 0.870
@@ -75,43 +103,11 @@ ROBOT_TALL_OBJECT_Y_GAIN = 1.06
 # Integrated robot-arm and conveyor settings.
 ROBOT_ARM_PORT = "COM3"
 ROBOT_ARM_BAUD = 115200
-ROBOT_FORWARD_TO_CENTER_MM = 209.5
-RIGHT_ARM_FORWARD_TO_CENTER_MM = 205.5
-ROBOT_TOOL_LEFT_OFFSET_MM = 12.0
-ROBOT_L1_MM = 130.0
-ROBOT_L2_MM = 130.0
-ROBOT_L3_MM = 76.0
-ROBOT_J2_HEIGHT_MM = 51.3
-ROBOT_IK_TOLERANCE_MM = 3.0
-ROBOT_APPROACH_J4_OFFSET_DEG = 4.5
-ROBOT_PRELOAD_J4_OFFSET_DEG = 3.0
-ROBOT_J1_FINE_OFFSET_DEG = -0.5
-ROBOT_POSITIVE_X_J1_OFFSET_DEG = -4.0
-RIGHT_ARM_MOUNT_ROTATION_CORRECTION_DEG = 0.0
-RIGHT_ARM_CAMERA_X_OFFSET_MM = 0.0
-RIGHT_ARM_CAMERA_Y_OFFSET_MM = 0.0
-RIGHT_ARM_J1_FINE_OFFSET_DEG = -0.5
-RIGHT_ARM_LOCAL_POSITIVE_X_J1_OFFSET_DEG = -4.0
-RIGHT_ARM_LOCAL_NEGATIVE_X_J1_OFFSET_DEG = 3.5
-RIGHT_ARM_FAR_NEGATIVE_Y_MM = -60.0
-RIGHT_ARM_NEAR_NEGATIVE_Y_MM = -20.0
-RIGHT_ARM_FAR_NEGATIVE_Y_J1_OFFSET_DEG = 2.0
-EDGE_3CM_MIN_CAMERA_X_MM = 90.0
-EDGE_3CM_MIN_CAMERA_Y_MM = 75.0
-EDGE_3CM_EXTRA_DROP_MM = 4.0
-CENTER_RISK_MIN_X_MM = -120.0
-CENTER_RISK_MAX_X_MM = 120.0
-CENTER_RISK_HALF_Y_MM = 30.0
-CENTER_SIMULTANEOUS_MIN_X_GAP_MM = 140.0
-
 
 class RuntimeControlKey(Exception):
     def __init__(self, key: int):
         super().__init__(key)
         self.key = key
-
-
-_ARM_PLAN_CACHE: dict[tuple, dict] = {}
 
 
 def scene_positions_stable(
@@ -138,271 +134,13 @@ def scene_positions_stable(
     return True
 
 
-def _arm_ik(camera_x_mm: float, camera_y_mm: float, target_z_mm: float,
-            compression_mm: float, max_tilt_deg: float,
-            forward_to_center_mm: float = ROBOT_FORWARD_TO_CENTER_MM) -> Optional[dict]:
-    """Same 0.5-degree IK used by the verified single-cube simulator."""
-    robot_x = float(forward_to_center_mm) - float(camera_y_mm)
-    robot_y = float(camera_x_mm)
-    target_radius = float(np.hypot(robot_x, robot_y))
-    if target_radius < ROBOT_TOOL_LEFT_OFFSET_MM:
-        return None
-    radial = float(np.sqrt(target_radius ** 2 - ROBOT_TOOL_LEFT_OFFSET_MM ** 2))
-    yaw = float(np.arctan2(robot_y, robot_x) - np.arctan2(ROBOT_TOOL_LEFT_OFFSET_MM, radial))
-    j1 = 90.0 - float(np.degrees(yaw))
-    if not 0.0 <= j1 <= 180.0:
-        return None
-
-    tilts = [0.0]
-    for half_step in range(1, int(max_tilt_deg * 2.0) + 1):
-        tilt = half_step * 0.5
-        tilts.extend((tilt, -tilt))
-    best = None
-    for tilt in tilts:
-        best_at_tilt = None
-        for j2_half in range(361):
-            j2 = j2_half * 0.5
-            for j3_half in range(181):
-                j3 = j3_half * 0.5
-                a2 = j2 - 60.0 - j3
-                j4 = tilt - a2
-                if not 0.0 <= j4 <= 180.0:
-                    continue
-                a3 = -90.0 + tilt
-                l3 = ROBOT_L3_MM - compression_mm
-                rr = (
-                    ROBOT_L1_MM * np.cos(np.radians(j2))
-                    + ROBOT_L2_MM * np.cos(np.radians(a2))
-                    + l3 * np.cos(np.radians(a3))
-                )
-                zz = (
-                    ROBOT_J2_HEIGHT_MM
-                    + ROBOT_L1_MM * np.sin(np.radians(j2))
-                    + ROBOT_L2_MM * np.sin(np.radians(a2))
-                    + l3 * np.sin(np.radians(a3))
-                )
-                dist = float(np.hypot(rr - radial, zz - target_z_mm))
-                candidate = {
-                    "j1": round(j1 * 2.0) / 2.0,
-                    "j2": j2,
-                    "j3": j3,
-                    "j4": j4,
-                    "tilt": tilt,
-                    "error": dist,
-                }
-                if best_at_tilt is None or dist < best_at_tilt["error"]:
-                    best_at_tilt = candidate
-                if best is None or dist < best["error"]:
-                    best = candidate
-        if best_at_tilt is not None and best_at_tilt["error"] <= ROBOT_IK_TOLERANCE_MM:
-            return best_at_tilt
-    return best
-
-
-def object_in_left_workspace(obj: dict) -> bool:
-    if any(obj.get(key) is None for key in ("robot_x_mm", "robot_y_mm", "robot_z_mm")):
-        return False
-    camera_x = float(obj["robot_x_mm"])
-    camera_y = float(obj["robot_y_mm"])
-    measured_z = float(obj["robot_z_mm"])
-    cube_size = 30 if abs(measured_z - 30.0) <= abs(measured_z - 50.0) else 50
-    half = cube_size / 2.0
-    return (
-        camera_y >= 0.0
-        and camera_y + half <= 105.0
-        # X는 물체 전체 폭이 아니라 물체 중심 좌표로 작업영역을 구분한다.
-        and -120.0 <= camera_x <= 120.0
-    )
-
-
-def object_in_right_workspace(obj: dict) -> bool:
-    if any(obj.get(key) is None for key in ("robot_x_mm", "robot_y_mm", "robot_z_mm")):
-        return False
-    camera_x = float(obj["robot_x_mm"])
-    camera_y = float(obj["robot_y_mm"])
-    measured_z = float(obj["robot_z_mm"])
-    cube_size = 30 if abs(measured_z - 30.0) <= abs(measured_z - 50.0) else 50
-    half = cube_size / 2.0
-    return (
-        camera_y < 0.0
-        and camera_y - half >= -105.0
-        and -120.0 <= camera_x <= 120.0
-    )
-
-
-def build_arm_pick_plan(obj: dict, arm: str = "left") -> dict:
-    global_camera_x = float(obj["robot_x_mm"])
-    global_camera_y = float(obj["robot_y_mm"])
-    measured_z = float(obj["robot_z_mm"])
-    cube_size = 30 if abs(measured_z - 30.0) <= abs(measured_z - 50.0) else 50
-    if arm == "right" and not object_in_right_workspace(obj):
-        raise ValueError("큐브 전체가 오른쪽 로봇 작업영역 안에 있지 않습니다.")
-    if arm != "right" and not object_in_left_workspace(obj):
-        raise ValueError("큐브 전체가 왼쪽 로봇 작업영역 안에 있지 않습니다.")
-
-    cache_key = (
-        arm,
-        cube_size,
-        int(round(global_camera_x / ARM_PLAN_CACHE_GRID_MM)),
-        int(round(global_camera_y / ARM_PLAN_CACHE_GRID_MM)),
-    )
-    cached_plan = _ARM_PLAN_CACHE.get(cache_key)
-    if cached_plan is not None:
-        result = copy.deepcopy(cached_plan)
-        result["camera_x"] = global_camera_x
-        result["camera_y"] = global_camera_y
-        return result
-
-    if arm == "right":
-        rotation_rad = np.radians(180.0 + RIGHT_ARM_MOUNT_ROTATION_CORRECTION_DEG)
-        camera_x = (
-            np.cos(rotation_rad) * global_camera_x
-            - np.sin(rotation_rad) * global_camera_y
-            + RIGHT_ARM_CAMERA_X_OFFSET_MM
-        )
-        camera_y = (
-            np.sin(rotation_rad) * global_camera_x
-            + np.cos(rotation_rad) * global_camera_y
-            + RIGHT_ARM_CAMERA_Y_OFFSET_MM
-        )
-    else:
-        camera_x = global_camera_x
-        camera_y = global_camera_y
-    top = float(cube_size)
-    forward_to_center_mm = (
-        RIGHT_ARM_FORWARD_TO_CENTER_MM
-        if arm == "right"
-        else ROBOT_FORWARD_TO_CENTER_MM
-    )
-    edge_extra_drop = (
-        EDGE_3CM_EXTRA_DROP_MM
-        if cube_size == 30
-        and camera_x >= EDGE_3CM_MIN_CAMERA_X_MM
-        and camera_y >= EDGE_3CM_MIN_CAMERA_Y_MM
-        else 0.0
-    )
-    contact_z = top - edge_extra_drop
-    approach = _arm_ik(
-        camera_x, camera_y, top + 16.0, 0.0, 15.0, forward_to_center_mm
-    )
-    contact = _arm_ik(
-        camera_x, camera_y, contact_z, 0.0, 15.0, forward_to_center_mm
-    )
-    preload_compression = 2.0
-    preload = _arm_ik(
-        camera_x, camera_y, contact_z, preload_compression, 15.0, forward_to_center_mm
-    )
-    for _ in range(2):
-        if preload is None:
-            break
-        adjusted = min(5.0, 2.0 + abs(float(preload["tilt"])) * 0.2)
-        if abs(adjusted - preload_compression) < 0.01:
-            break
-        preload_compression = adjusted
-        preload = _arm_ik(
-            camera_x, camera_y, contact_z, preload_compression, 15.0,
-            forward_to_center_mm
-        )
-    lift = _arm_ik(
-        camera_x, camera_y, top + 16.0, 8.0, 45.0, forward_to_center_mm
-    )
-    poses = (approach, contact, preload, lift)
-    if any(p is None or p["error"] > ROBOT_IK_TOLERANCE_MM for p in poses):
-        raise ValueError("접근·접촉·예압·상승 자세 중 도달할 수 없는 단계가 있습니다.")
-
-    # 실기 캘리브레이션:
-    # - 상부 접근·접촉 J4 +4.5°, 수직이 맞는 예압 J4 +3°
-    # - 양팔 J1 보정은 독립 설정하며, 각 팔의 local +X에서 추가 보정을 적용한다.
-    for pose in (approach, contact):
-        pose["j4"] = float(np.clip(
-            pose["j4"] + ROBOT_APPROACH_J4_OFFSET_DEG, 0.0, 180.0
-        ))
-    preload["j4"] = float(np.clip(
-        preload["j4"] + ROBOT_PRELOAD_J4_OFFSET_DEG, 0.0, 180.0
-    ))
-
-    if arm == "right":
-        j1_offset = RIGHT_ARM_J1_FINE_OFFSET_DEG
-        if camera_x > 0.0:
-            j1_offset += RIGHT_ARM_LOCAL_POSITIVE_X_J1_OFFSET_DEG
-        elif camera_x < 0.0:
-            y_blend = float(np.clip(
-                (RIGHT_ARM_NEAR_NEGATIVE_Y_MM - global_camera_y)
-                / (RIGHT_ARM_NEAR_NEGATIVE_Y_MM - RIGHT_ARM_FAR_NEGATIVE_Y_MM),
-                0.0,
-                1.0,
-            ))
-            j1_offset += (
-                RIGHT_ARM_LOCAL_NEGATIVE_X_J1_OFFSET_DEG
-                + y_blend
-                * (
-                    RIGHT_ARM_FAR_NEGATIVE_Y_J1_OFFSET_DEG
-                    - RIGHT_ARM_LOCAL_NEGATIVE_X_J1_OFFSET_DEG
-                )
-            )
-    else:
-        j1_offset = ROBOT_J1_FINE_OFFSET_DEG
-        if camera_x > 0.0:
-            j1_offset += ROBOT_POSITIVE_X_J1_OFFSET_DEG
-    for pose in poses:
-        pose["j1"] = float(np.clip(pose["j1"] + j1_offset, 0.0, 180.0))
-
-    result = {
-        "arm": arm,
-        "size": cube_size,
-        "camera_x": global_camera_x,
-        "camera_y": global_camera_y,
-        "local_camera_x": camera_x,
-        "local_camera_y": camera_y,
-        "edge_extra_drop": edge_extra_drop,
-        "approach": approach,
-        "contact": contact,
-        "preload": preload,
-        "lift": lift,
-    }
-    if len(_ARM_PLAN_CACHE) >= ARM_PLAN_CACHE_MAX_ENTRIES:
-        _ARM_PLAN_CACHE.clear()
-    _ARM_PLAN_CACHE[cache_key] = copy.deepcopy(result)
-    return result
-
-
-def write_arm_line(arm_ser, line: str) -> None:
-    arm_ser.reset_input_buffer()
-    # The current BSP UART receiver is polling one byte at a time. Pace the
-    # USB-VCP bytes so the STM32 RDR is not overrun by one large PC-side burst.
-    for byte in line.encode("ascii"):
-        arm_ser.write(bytes((byte,)))
-        arm_ser.flush()
-        time.sleep(0.020)
-
-
-def _format_arm_value(value: float) -> str:
-    """Keep one-decimal precision without transmitting unnecessary '.0' bytes."""
-    return f"{value:.1f}".rstrip("0").rstrip(".")
-
-
 def send_arm_plan(arm_ser, plan: dict) -> None:
-    poses = [plan["approach"], plan["contact"], plan["preload"], plan["lift"]]
-    values = [float(plan["size"]), poses[0]["j1"]]
-    for pose in poses:
-        values.extend((pose["j2"], pose["j3"], pose["j4"]))
-    line = "P," + ",".join(_format_arm_value(value) for value in values) + "\n"
-    write_arm_line(arm_ser, line)
+    write_arm_line(arm_ser, _build_single_arm_line(plan))
     log_status(
         f"로봇팔 전송: {plan['size']} mm, Camera X={plan['camera_x']:.1f}, "
         f"Y={plan['camera_y']:.1f} mm, 추가 하강={plan['edge_extra_drop']:.1f} mm",
         PHASE_SORTING,
     )
-
-
-def _plan_values(plan: Optional[dict]) -> list[float]:
-    if plan is None:
-        return [0.0] * 14
-    values = [float(plan["size"]), float(plan["approach"]["j1"])]
-    for pose_name in ("approach", "contact", "preload", "lift"):
-        pose = plan[pose_name]
-        values.extend((float(pose["j2"]), float(pose["j3"]), float(pose["j4"])))
-    return values
 
 
 def send_dual_arm_plans(
@@ -411,14 +149,10 @@ def send_dual_arm_plans(
     right_plan: Optional[dict],
     sequential: bool = True,
 ) -> None:
-    values = [1.0 if left_plan is not None else 0.0]
-    values.extend(_plan_values(left_plan))
-    values.append(1.0 if right_plan is not None else 0.0)
-    values.extend(_plan_values(right_plan))
-    line = ("D," if sequential else "M,") + ",".join(
-        _format_arm_value(value) for value in values
-    ) + "\n"
-    write_arm_line(arm_ser, line)
+    write_arm_line(
+        arm_ser,
+        _build_dual_arm_line(left_plan, right_plan, sequential=sequential),
+    )
     sides = []
     if left_plan is not None:
         sides.append(f"왼팔 {left_plan['size']}mm")
@@ -434,52 +168,6 @@ def send_dual_arm_plans(
         + (", ".join(sides) if sides else "현재 든 물체 놓기"),
         PHASE_SORTING,
     )
-
-
-def plan_in_center_risk_zone(plan: Optional[dict]) -> bool:
-    if plan is None:
-        return False
-    return (
-        CENTER_RISK_MIN_X_MM <= float(plan["camera_x"]) <= CENTER_RISK_MAX_X_MM
-        and -CENTER_RISK_HALF_Y_MM <= float(plan["camera_y"]) <= CENTER_RISK_HALF_Y_MM
-    )
-
-
-def center_priority_side(left_count: int, right_count: int) -> Optional[str]:
-    total = left_count + right_count
-    if total == 0:
-        return None
-    if total == 1:
-        return "left" if left_count else "right"
-    if total == 2:
-        return "left" if left_count else "right"
-    if total == 3:
-        return "left" if left_count > right_count else "right"
-    if left_count == right_count:
-        return "left"
-    return "left" if left_count > right_count else "right"
-
-
-def choose_pipeline_plans(
-    holding_side: Optional[str],
-    left_plans: list[dict],
-    right_plans: list[dict],
-    preferred_side: str,
-) -> tuple[Optional[dict], Optional[dict]]:
-    """한 번에 중앙 작업영역으로 진입하는 빈 팔은 반드시 하나만 선택한다."""
-    if holding_side == "left":
-        return None, (right_plans[0] if right_plans else None)
-    if holding_side == "right":
-        return (left_plans[0] if left_plans else None), None
-    if preferred_side == "left" and left_plans:
-        return left_plans[0], None
-    if preferred_side == "right" and right_plans:
-        return None, right_plans[0]
-    if left_plans:
-        return left_plans[0], None
-    if right_plans:
-        return None, right_plans[0]
-    return None, None
 
 
 def request_emergency_stop(arm_ser, conveyor_ser=None) -> None:
@@ -579,10 +267,6 @@ def log_warning(message: str) -> None:
     print(f"{color_tag('주의', ANSI_BRIGHT_RED)} {message}", flush=True)
 
 
-def log_save(message: str) -> None:
-    print(f"{color_tag('저장', ANSI_BRIGHT_MAGENTA)} {message}", flush=True)
-
-
 def clean_stm32_message(message: str) -> str:
     cleaned = message.strip()
     while cleaned.startswith("[STM32]"):
@@ -604,133 +288,15 @@ def korean_stm32_message(message: str) -> Optional[tuple[str, str]]:
     return known_messages.get(cleaned, (PHASE_SYSTEM, f"STM32 메시지: {cleaned}"))
 
 
-def object_still_visible(original_obj: dict, current_objects: list[dict]) -> bool:
-    for current_obj in current_objects:
-        dx = float(current_obj["x"] - original_obj["x"])
-        dy = float(current_obj["y"] - original_obj["y"])
-        if float(np.hypot(dx, dy)) <= OBJECT_REMOVED_MATCH_PX:
-            return True
-    return False
-
-
-@dataclass
-class CameraConfig:
-    width: int = 848
-    height: int = 480
-    fps: int = 30
-    serial: Optional[str] = None
-    enable_color: bool = True
-    enable_depth: bool = True
-    align_to_color: bool = True
-    depth_min_m: float = 0.2
-    depth_max_m: float = 2.5
-    show_depth_panel: bool = False
-    detect_rectangle: bool = True
-    rect_min_area: int = 500
-    rect_min_side_px: int = 45
-    depth_top_min_side_ratio: float = 0.82
-    rect_max_aspect_ratio: float = 8.0
-    rect_min_extent: float = 0.18
-    rect_max_area_ratio: float = 0.80
-    rect_border_margin_px: int = 4
-    center_roi_only: bool = True
-    center_roi_ratio: float = 0.60
-    target_min_distance_m: float = 0.10
-    target_max_distance_m: float = 0.60
-    target_min_height_m: float = 0.004
-    target_band_half_width_m: float = 0.035
-    quad_depth_std_max_m: float = 0.035
-    quad_depth_valid_min_ratio: float = 0.45
-    quad_depth_lift_min_m: float = 0.006
-    quad_depth_ring_margin_px: int = 10
-    top_face_min_abs_nz: float = 0.58
-    top_face_depth_span_max_m: float = 0.030
-    debug_detection: bool = False
-    debug_print_interval: int = 15
-    corner_only_display: bool = True
-    corner_smooth_alpha: float = 0.72
-    corner_hold_frames: int = 12
-    center_weight_power: float = 2.6
-    corner_deadband_px: float = 4.0
-    corner_jump_guard_px: float = 22.0
-    corner_continuity_weight: float = 0.50
-    corner_micro_center_px: float = 1.1
-    corner_micro_alpha: float = 0.88
-    coord_lock_enabled: bool = False
-    coord_lock_enter_px: float = 3.2
-    coord_lock_exit_px: float = 10.0
-    coord_lock_frames: int = 3
-    coord_lock_depth_exit_m: float = 0.022
-    coord_lock_static_mode: bool = True
-    coord_lock_static_min_frames: int = 18
-    coord_lock_sticky_slots: bool = True
-    coord_lock_sticky_max_miss: int = 300
-    coord_lock_move_release_frames: int = 6
-    show_hold_slots: bool = False
-    measure_size: bool = True
-    max_objects: int = 4
-    object_nms_iou: float = 0.22
-    object_min_score_ratio: float = 0.30
-    object_duplicate_center_ratio: float = 0.75
-    object_duplicate_depth_diff_m: float = 0.03
-    object_known_band_duplicate_center_ratio: float = 0.52
-    object_small_band_duplicate_center_ratio: float = 0.44
-    object_cross_band_duplicate_center_ratio: float = 0.24
-    object_secondary_score_ratio: float = 0.10
-    object_secondary_area_ratio: float = 0.10
-    object_area_score_power: float = 0.42
-    object_near_score_gain: float = 0.12
-    object_small_band_score_gain: float = 0.18
-    white_bias_enabled: bool = True
-    white_min_ratio: float = 0.18
-    white_sat_max: int = 64
-    white_value_min: int = 140
-    white_score_gain: float = 0.55
-    depth_top_priority_enabled: bool = True
-    depth_top_min_height_m: float = 0.010
-    depth_top_max_height_m: float = 0.090
-    depth_top_band_m: float = 0.010
-    depth_top_support_percentile: float = 86.0
-    depth_top_split_enabled: bool = True
-    depth_top_split_aspect_ratio: float = 1.35
-    depth_top_peak_split_enabled: bool = False
-    depth_top_quad_inset_ratio: float = 0.12
-    quad_edge_refine_enabled: bool = False
-    quad_edge_refine_normal_ratio: float = 0.14
-    quad_edge_refine_tangent_ratio: float = 0.22
-    quad_edge_refine_max_shift_ratio: float = 0.24
-    quad_edge_refine_min_points: int = 8
-    display_quad_contour_refine_enabled: bool = True
-    display_quad_contour_blend: float = 0.68
-    display_quad_contour_max_center_shift_ratio: float = 0.22
-    display_quad_approx_eps_ratios: tuple[float, ...] = (0.014, 0.020, 0.026, 0.032, 0.040)
-    display_quad_deadband_px: float = 1.6
-    display_quad_smooth_alpha: float = 0.72
-    depth_top_known_height_bands_enabled: bool = True
-    depth_top_height_targets_m: tuple[float, ...] = (0.03, 0.05)
-    depth_top_height_tol_m: float = 0.012
-    depth_top_known_band_min_side_factor: float = 0.78
-    depth_top_small_band_min_side_factor: float = 0.72
-    depth_top_small_object_height_m: float = 0.038
-    depth_top_small_split_area_ratio: float = 1.28
-    depth_top_known_band_split_area_ratio: float = 1.34
-    depth_top_band_balance_enabled: bool = False
-    depth_top_band_score_gain: float = 0.0
-    support_depth_bin_m: float = 0.004
-    support_depth_band_m: float = 0.008
-    depth_filter_enabled: bool = True
-    depth_temporal_alpha: float = 0.35
-    depth_temporal_delta: float = 20.0
-    depth_spatial_alpha: float = 0.50
-    depth_spatial_delta: float = 20.0
-    depth_hole_fill_mode: int = 1
-    tune_sensors: bool = False
-    frame_wait_timeout_ms: int = 1500
-    startup_frame_timeout_ms: int = 1200
-    startup_frame_retries: int = 3
-
-
 class D435Camera:
+    _inset_quad = staticmethod(inset_quad)
+    _intersect_parametric_lines = staticmethod(intersect_parametric_lines)
+    _align_quad_to_reference = staticmethod(align_quad_to_reference)
+    _quad_iou = staticmethod(quad_iou)
+    _candidate_slot_key = staticmethod(candidate_slot_key)
+    _order_quad_points = staticmethod(order_quad_points)
+    _is_rectangular_quad = staticmethod(is_rectangular_quad)
+
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
         self.pipeline = rs.pipeline()
@@ -770,7 +336,7 @@ class D435Camera:
 
     def start(self) -> None:
         self._ensure_device_present()
-        profile, used_profile = self._start_with_fallback_profiles()
+        profile, _ = self._start_with_fallback_profiles()
         device = profile.get_device()
         self._print_device_info(device)
         if self.cfg.tune_sensors:
@@ -922,9 +488,7 @@ class D435Camera:
             PHASE_DETECTING,
         )
 
-    def preview(self, save_dir: str = "captures") -> None:
-        os.makedirs(save_dir, exist_ok=True)
-
+    def preview(self) -> None:
         ser = None
         arm_ser = None
         try:
@@ -1087,7 +651,6 @@ class D435Camera:
                                         plan for plan in right_plans
                                         if plan_in_center_risk_zone(plan)
                                     ]
-                                    center_count = len(center_left) + len(center_right)
                                     center_priority = center_priority_side(
                                         len(center_left), len(center_right)
                                     )
@@ -1400,189 +963,6 @@ class D435Camera:
                     PHASE_SYSTEM,
                 )
                 continue
-                log_status("다중 물체 자동 처리를 시작합니다.", PHASE_SORTING)
-                processed_count = 0
-                holding_side = None
-                preferred_side = "left"
-                while True:
-                    objects = [dict(obj) for obj in self.last_tracked_objects]
-                    valid_objects = [
-                        obj for obj in objects
-                        if obj.get("robot_x_mm") is not None
-                        and obj.get("robot_y_mm") is not None
-                        and obj.get("robot_z_mm") is not None
-                    ]
-                    left_objects = [obj for obj in valid_objects if object_in_left_workspace(obj)]
-                    right_objects = [obj for obj in valid_objects if object_in_right_workspace(obj)]
-                    eligible_objects = left_objects + right_objects
-                    left_plans = []
-                    right_plans = []
-                    for obj in left_objects:
-                        try:
-                            left_plans.append(build_arm_pick_plan(obj, "left"))
-                        except ValueError as exc:
-                            log_warning(f"왼팔 객체 {obj.get('id', '?')} 제외: {exc}")
-                    for obj in right_objects:
-                        try:
-                            right_plans.append(build_arm_pick_plan(obj, "right"))
-                        except ValueError as exc:
-                            log_warning(f"오른팔 객체 {obj.get('id', '?')} 제외: {exc}")
-
-                    if not left_plans and not right_plans and holding_side is not None:
-                        send_dual_arm_plans(arm_ser, None, None)
-                        reply = wait_arm_reply(
-                            arm_ser, ("PLACED", "ERROR", "BUSY"), conveyor_ser=ser
-                        )
-                        if reply != "PLACED":
-                            log_warning("마지막 보유 물체 놓기에 실패했습니다.")
-                            if reply is None:
-                                hold_system_on_arm_fault(ser, "마지막 놓기 응답 시간 초과")
-                            break
-                        processed_count += 1
-                        holding_side = None
-                        self._reset_tracking_state()
-                        self._wait_for_stable_scene(
-                            CAMERA_REACQUIRE_MAX_SEC,
-                            CAMERA_REACQUIRE_STABLE_FRAMES,
-                        )
-                        continue
-
-                    if not left_plans and not right_plans:
-                        if eligible_objects:
-                            log_warning("물체는 남아 있지만 현재 로봇이 도달할 수 없습니다.")
-                            break
-                        log_status("물체 없음 확인을 위해 카메라를 다시 검사합니다.", PHASE_DETECTING)
-                        empty_frames = 0
-                        for _ in range(EMPTY_CONFIRM_FRAMES + 8):
-                            color_img, depth_img = self.get_frames()
-                            display = self._compose_display(color_img, depth_img)
-                            self._draw_runtime_mode_banner(display)
-                            cv2.imshow("D435 Preview", display)
-                            control_key = cv2.waitKey(1) & 0xFF
-                            if control_key in (27, ord("q"), ord("x"), ord("z")):
-                                raise RuntimeControlKey(control_key)
-                            current = [
-                                obj for obj in self.last_tracked_objects
-                                if object_in_left_workspace(obj) or object_in_right_workspace(obj)
-                            ]
-                            empty_frames = empty_frames + 1 if not current else 0
-                        if empty_frames < EMPTY_CONFIRM_FRAMES:
-                            continue
-                        log_status("작업영역에 물체가 없습니다. 종료 명령을 전송합니다.", PHASE_DONE)
-                        write_arm_line(arm_ser, "F\n")
-                        wait_arm_reply(
-                            arm_ser, ("FINISHED", "ERROR"), 60.0, conveyor_ser=ser
-                        )
-                        log_status(f"총 {processed_count}개 물체 처리를 종료했습니다.", PHASE_DONE)
-                        break
-
-                    left_plans.sort(
-                        key=lambda plan: float(np.hypot(
-                            ROBOT_FORWARD_TO_CENTER_MM - plan["local_camera_y"],
-                            plan["local_camera_x"],
-                        ))
-                    )
-                    right_plans.sort(
-                        key=lambda plan: float(np.hypot(
-                            ROBOT_FORWARD_TO_CENTER_MM - plan["local_camera_y"],
-                            plan["local_camera_x"],
-                        ))
-                    )
-                    candidate_left = left_plans[0] if left_plans else None
-                    candidate_right = right_plans[0] if right_plans else None
-                    center_left = [
-                        plan for plan in left_plans if plan_in_center_risk_zone(plan)
-                    ]
-                    center_right = [
-                        plan for plan in right_plans if plan_in_center_risk_zone(plan)
-                    ]
-                    center_count = len(center_left) + len(center_right)
-                    center_priority = center_priority_side(
-                        len(center_left), len(center_right)
-                    )
-                    selected_both_center = (
-                        plan_in_center_risk_zone(candidate_left)
-                        and plan_in_center_risk_zone(candidate_right)
-                    )
-                    selected_x_gap = (
-                        abs(
-                            float(candidate_left["camera_x"])
-                            - float(candidate_right["camera_x"])
-                        )
-                        if candidate_left is not None and candidate_right is not None
-                        else float("inf")
-                    )
-                    use_sequential = holding_side is not None or (
-                        selected_both_center
-                        and selected_x_gap < CENTER_SIMULTANEOUS_MIN_X_GAP_MM
-                    )
-                    if use_sequential:
-                        left_plan, right_plan = choose_pipeline_plans(
-                            holding_side,
-                            center_left,
-                            center_right,
-                            center_priority or preferred_side,
-                        )
-                    else:
-                        left_plan, right_plan = candidate_left, candidate_right
-                    self.prefetched_scene_ready = False
-                    send_dual_arm_plans(
-                        arm_ser, left_plan, right_plan, sequential=use_sequential
-                    )
-                    log_status(
-                        "교차 순차제어 완료 응답을 기다립니다."
-                        if use_sequential else "양팔 동시 작업 완료 응답을 기다립니다.",
-                        PHASE_SORTING,
-                    )
-                    expected = (
-                        ("HOLDING", "CROSS_DONE", "PLACED", "ERROR", "BUSY")
-                        if use_sequential else
-                        ("DONE", "ERROR", "BUSY")
-                    )
-                    reply = wait_arm_reply(
-                        arm_ser, expected, conveyor_ser=ser,
-                        camera_clear_callback=(
-                            self._prefetch_scene_while_arms_place
-                            if not use_sequential else None
-                        ),
-                    )
-                    if (use_sequential and reply not in ("HOLDING", "CROSS_DONE", "PLACED")) or (
-                        not use_sequential and reply != "DONE"
-                    ):
-                        if reply is None:
-                            hold_system_on_arm_fault(ser, "로봇팔 응답 시간 초과")
-                        break
-                    if not use_sequential:
-                        processed_count += int(left_plan is not None) + int(right_plan is not None)
-                        holding_side = None
-                        preferred_side = "right" if preferred_side == "left" else "left"
-                        if not self.prefetched_scene_ready:
-                            self._reset_tracking_state()
-                            self._wait_for_stable_scene(
-                                CAMERA_REACQUIRE_MAX_SEC,
-                                CAMERA_REACQUIRE_STABLE_FRAMES,
-                            )
-                        self.prefetched_scene_ready = False
-                        continue
-                    sent_side = "left" if left_plan is not None else (
-                        "right" if right_plan is not None else None
-                    )
-                    if reply == "HOLDING":
-                        holding_side = sent_side
-                    elif reply == "CROSS_DONE":
-                        processed_count += 1
-                        holding_side = sent_side
-                        preferred_side = "right" if sent_side == "left" else "left"
-                    else:
-                        processed_count += 1
-                        holding_side = None
-
-                    # Discard buffered pre-pick frames and reacquire the scene.
-                    self._reset_tracking_state()
-                    self._wait_for_stable_scene(
-                        CAMERA_REACQUIRE_MAX_SEC,
-                        CAMERA_REACQUIRE_STABLE_FRAMES,
-                    )
         if ser is not None:
             ser.close()
             log_status("STM32 연결을 종료했습니다.")
@@ -1617,7 +997,9 @@ class D435Camera:
         elif not self.detection_overlay_enabled:
             self.last_tracked_objects = []
 
-        if depth_img is not None:
+        # Do not build a full depth colormap when the color-only preview is in
+        # use. Detection still receives the original depth image above.
+        if depth_img is not None and (color_img is None or bool(self.cfg.show_depth_panel)):
             depth_colormap = self._depth_to_colormap(depth_img)
         else:
             depth_colormap = None
@@ -1639,17 +1021,12 @@ class D435Camera:
         raise RuntimeError("No stream enabled.")
 
     def _depth_to_colormap(self, depth_raw: np.ndarray) -> np.ndarray:
-        depth_m = depth_raw.astype(np.float32) * self.depth_scale
-        depth_m = np.clip(depth_m, self.cfg.depth_min_m, self.cfg.depth_max_m)
-
-        scale = max(self.cfg.depth_max_m - self.cfg.depth_min_m, 1e-6)
-        depth_norm = (depth_m - self.cfg.depth_min_m) / scale
-        depth_u8 = (255.0 * (1.0 - depth_norm)).astype(np.uint8)
-        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
-
-        invalid = depth_raw == 0
-        depth_color[invalid] = (0, 0, 0)
-        return depth_color
+        return depth_to_colormap(
+            depth_raw,
+            self.depth_scale,
+            self.cfg.depth_min_m,
+            self.cfg.depth_max_m,
+        )
 
     def _detect_and_draw_rectangle(self, color_img: np.ndarray, depth_img: Optional[np.ndarray]) -> np.ndarray:
         annotated = color_img.copy()
@@ -1720,8 +1097,6 @@ class D435Camera:
         max_center_dist = float(np.linalg.norm(img_center)) + 1e-6
         center_power = self._effective_center_weight_power()
         work_hsv = cv2.cvtColor(work_img, cv2.COLOR_BGR2HSV) if bool(self.cfg.white_bias_enabled) else None
-        support_depth_for_candidates = None if self.support_depth_m is None else float(self.support_depth_m)
-
         for contour, source in contour_entries:
             if debug_on:
                 debug_stats["input_by_source"][source] = debug_stats["input_by_source"].get(source, 0) + 1
@@ -2377,7 +1752,6 @@ class D435Camera:
             (120, 255, 120),
         ]
         detected_count = 0
-        hold_count = 0
         status_chunks = []
         size_counts: dict[str, int] = {}
         legend_rows = []
@@ -2473,9 +1847,7 @@ class D435Camera:
                         }
                     )
                 tracked_objects.append(tracked_obj)
-            if is_hold:
-                hold_count += 1
-            else:
+            if not is_hold:
                 detected_count += 1
 
         status = f"Objects: {detected_count}/{max_objects}"
@@ -2502,9 +1874,17 @@ class D435Camera:
         return annotated
 
     def _get_candidate_contours(self, work_img: np.ndarray, work_depth: Optional[np.ndarray]):
+        gray_blurred = None
+
+        def _get_gray_blurred():
+            nonlocal gray_blurred
+            if gray_blurred is None:
+                gray_blurred = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
+                gray_blurred = cv2.GaussianBlur(gray_blurred, (5, 5), 0)
+            return gray_blurred
+
         def _find_color_contours():
-            gray_local = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
-            gray_local = cv2.GaussianBlur(gray_local, (5, 5), 0)
+            gray_local = _get_gray_blurred()
             # Contrast boost helps black-object edges on mixed bright backgrounds.
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray_local = clahe.apply(gray_local)
@@ -2523,8 +1903,7 @@ class D435Camera:
             return cv2.findContours(edges_local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
 
         def _find_dark_contours():
-            gray_local = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
-            gray_local = cv2.GaussianBlur(gray_local, (5, 5), 0)
+            gray_local = _get_gray_blurred()
             p20 = float(np.percentile(gray_local, 20))
             p45 = float(np.percentile(gray_local, 45))
             dark_thr = int(np.clip(0.65 * p20 + 0.35 * p45, 18, 120))
@@ -2543,12 +1922,11 @@ class D435Camera:
                 & (depth_m >= self.cfg.target_min_distance_m)
                 & (depth_m <= self.cfg.target_max_distance_m)
             )
-            valid_ratio = float(np.count_nonzero(valid)) / float(valid.size + 1e-6)
+            valid_count = int(np.count_nonzero(valid))
+            valid_ratio = float(valid_count) / float(valid.size + 1e-6)
             all_contours = []
             mode_tags = []
-            support_depth_for_candidates = None
-
-            if np.count_nonzero(valid) > 500:
+            if valid_count > 500:
                 valid_depth = depth_m[valid]
                 depth_priority_contours = []
                 support_depth_est = self._estimate_support_depth_m(depth_m, valid)
@@ -2557,11 +1935,13 @@ class D435Camera:
                     if support_depth_est is not None
                     else float(np.percentile(valid_depth, np.clip(self.cfg.depth_top_support_percentile, 70.0, 98.0)))
                 )
-                support_depth_for_candidates = support_depth
                 if self.support_plane_coeffs is not None:
-                    yy, xx = np.indices(depth_m.shape, dtype=np.float32)
                     coeffs = self.support_plane_coeffs.astype(np.float32)
-                    support_depth_map = coeffs[0] * xx + coeffs[1] * yy + coeffs[2]
+                    x_coords = np.arange(depth_m.shape[1], dtype=np.float32)[None, :]
+                    y_coords = np.arange(depth_m.shape[0], dtype=np.float32)[:, None]
+                    support_depth_map = (
+                        coeffs[0] * x_coords + coeffs[1] * y_coords + coeffs[2]
+                    )
                     support_depth = float(np.median(support_depth_map[valid])) if np.any(valid) else support_depth
                 else:
                     support_depth_map = np.full(depth_m.shape, support_depth, dtype=np.float32)
@@ -2736,15 +2116,9 @@ class D435Camera:
             if all_contours:
                 return all_contours, "+".join(mode_tags), valid_ratio
 
-            # Very sparse depth -> fallback to color edges.
-            dark_contours, dark_thr = _find_dark_contours()
-            color_contours = _find_color_contours()
-            all_fb = []
-            if dark_contours:
-                all_fb.extend((c, "dark-blob") for c in dark_contours)
-            if color_contours:
-                all_fb.extend((c, "color-edge") for c in color_contours)
-            return all_fb, f"edge-fallback-low-depth+dark(t={dark_thr})", valid_ratio
+            # Both color searches just ran and found nothing; avoid repeating
+            # the same full-frame conversions and filters.
+            return [], f"edge-fallback-low-depth+dark(t={dark_thr})", valid_ratio
 
         dark_contours, dark_thr = _find_dark_contours()
         color_contours = _find_color_contours()
@@ -3098,7 +2472,7 @@ class D435Camera:
             peak_u8 = np.zeros(component_mask.shape, dtype=np.uint8)
             peak_u8[peak_mask] = 255
             peak_u8 = cv2.morphologyEx(peak_u8, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8), iterations=1)
-            peak_count, peak_labels, peak_stats, peak_centroids = cv2.connectedComponentsWithStats(peak_u8, connectivity=8)
+            peak_count, _, peak_stats, peak_centroids = cv2.connectedComponentsWithStats(peak_u8, connectivity=8)
             peak_candidates = []
             for label_idx in range(1, int(peak_count)):
                 peak_area = int(peak_stats[label_idx, cv2.CC_STAT_AREA])
@@ -3244,28 +2618,6 @@ class D435Camera:
             split_masks.append(refined_mask > 0)
 
         return split_masks
-
-    def _inset_quad(self, quad_xy: np.ndarray, inset_ratio: float) -> np.ndarray:
-        ratio = float(np.clip(inset_ratio, 0.0, 0.45))
-        if ratio <= 1e-6:
-            return quad_xy.astype(np.float32)
-        quad = quad_xy.astype(np.float32)
-        center = np.mean(quad, axis=0, keepdims=True)
-        return center + (quad - center) * (1.0 - ratio)
-
-    @staticmethod
-    def _intersect_parametric_lines(
-        p1: np.ndarray,
-        d1: np.ndarray,
-        p2: np.ndarray,
-        d2: np.ndarray,
-    ) -> Optional[np.ndarray]:
-        det = float(d1[0] * d2[1] - d1[1] * d2[0])
-        if abs(det) < 1e-6:
-            return None
-        diff = p2 - p1
-        t = float((diff[0] * d2[1] - diff[1] * d2[0]) / det)
-        return (p1 + t * d1).astype(np.float32)
 
     def _refine_quad_from_contour_edges(self, contour: np.ndarray, quad_xy: np.ndarray) -> np.ndarray:
         quad = quad_xy.astype(np.float32)
@@ -3498,24 +2850,20 @@ class D435Camera:
     def _sample_quad_depth_stats(self, depth_img: Optional[np.ndarray], quad_xy: np.ndarray):
         if depth_img is None:
             return None
-        h, w = depth_img.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        quad_i = np.round(quad_xy).astype(np.int32)
-        quad_i[:, 0] = np.clip(quad_i[:, 0], 0, w - 1)
-        quad_i[:, 1] = np.clip(quad_i[:, 1], 0, h - 1)
-        cv2.fillConvexPoly(mask, quad_i, 255)
 
+        slices, mask = quad_mask_roi(depth_img.shape, quad_xy)
+        depth_roi = depth_img[slices]
         inside = mask > 0
         total_inside = int(np.count_nonzero(inside))
         if total_inside < 200:
             return None
 
-        valid = inside & (depth_img > 0)
+        valid = inside & (depth_roi > 0)
         valid_count = int(np.count_nonzero(valid))
         if valid_count < 80:
             return None
 
-        depth_vals = depth_img[valid].astype(np.float32) * self.depth_scale
+        depth_vals = depth_roi[valid].astype(np.float32) * self.depth_scale
         depth_med = float(np.median(depth_vals))
         depth_std = float(np.std(depth_vals))
         valid_ratio = float(valid_count) / float(total_inside + 1e-6)
@@ -3525,19 +2873,14 @@ class D435Camera:
         if depth_img is None:
             return None
 
-        h, w = depth_img.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        quad_i = np.round(quad_xy).astype(np.int32)
-        quad_i[:, 0] = np.clip(quad_i[:, 0], 0, w - 1)
-        quad_i[:, 1] = np.clip(quad_i[:, 1], 0, h - 1)
-        cv2.fillConvexPoly(mask, quad_i, 255)
-
+        ring_margin_px = int(np.clip(self.cfg.quad_depth_ring_margin_px, 2, 40))
+        slices, mask = quad_mask_roi(depth_img.shape, quad_xy, margin=ring_margin_px)
+        depth_roi = depth_img[slices]
         inside = mask > 0
         inside_total = int(np.count_nonzero(inside))
         if inside_total < 180:
             return None
 
-        ring_margin_px = int(np.clip(self.cfg.quad_depth_ring_margin_px, 2, 40))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring_margin_px + 1, 2 * ring_margin_px + 1))
         outer = cv2.dilate(mask, kernel, iterations=1) > 0
         ring = outer & (~inside)
@@ -3545,7 +2888,7 @@ class D435Camera:
         if ring_total < 140:
             return None
 
-        valid = depth_img > 0
+        valid = depth_roi > 0
         inside_valid = inside & valid
         ring_valid = ring & valid
         inside_valid_count = int(np.count_nonzero(inside_valid))
@@ -3558,8 +2901,8 @@ class D435Camera:
         if inside_ratio < 0.18 or ring_ratio < 0.14:
             return None
 
-        inside_vals = depth_img[inside_valid].astype(np.float32) * self.depth_scale
-        ring_vals = depth_img[ring_valid].astype(np.float32) * self.depth_scale
+        inside_vals = depth_roi[inside_valid].astype(np.float32) * self.depth_scale
+        ring_vals = depth_roi[ring_valid].astype(np.float32) * self.depth_scale
         if inside_vals.size < 40 or ring_vals.size < 40:
             return None
 
@@ -3579,27 +2922,24 @@ class D435Camera:
         if depth_img is None or self.measure_intrinsics is None:
             return None
 
-        h, w = depth_img.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        quad_i = np.round(quad_xy).astype(np.int32)
-        quad_i[:, 0] = np.clip(quad_i[:, 0], 0, w - 1)
-        quad_i[:, 1] = np.clip(quad_i[:, 1], 0, h - 1)
-        cv2.fillConvexPoly(mask, quad_i, 255)
-
-        valid = (mask > 0) & (depth_img > 0)
+        slices, mask = quad_mask_roi(depth_img.shape, quad_xy)
+        depth_roi = depth_img[slices]
+        valid = (mask > 0) & (depth_roi > 0)
         count = int(np.count_nonzero(valid))
         if count < 120:
             return None
 
-        ys, xs = np.where(valid)
+        ys_local, xs_local = np.where(valid)
         if count > 320:
             step = int(np.ceil(count / 320.0))
-            ys = ys[::step]
-            xs = xs[::step]
-        if ys.size < 40:
+            ys_local = ys_local[::step]
+            xs_local = xs_local[::step]
+        if ys_local.size < 40:
             return None
 
-        z = depth_img[ys, xs].astype(np.float32) * self.depth_scale
+        z = depth_roi[ys_local, xs_local].astype(np.float32) * self.depth_scale
+        ys = ys_local + int(slices[0].start)
+        xs = xs_local + int(slices[1].start)
         intr = self.measure_intrinsics
         x3 = (xs.astype(np.float32) - float(intr.ppx)) * z / float(intr.fx)
         y3 = (ys.astype(np.float32) - float(intr.ppy)) * z / float(intr.fy)
@@ -3629,20 +2969,15 @@ class D435Camera:
         if hsv_img is None:
             return None
 
-        h, w = hsv_img.shape[:2]
-        quad_i = np.round(quad_xy).astype(np.int32)
-        quad_i[:, 0] = np.clip(quad_i[:, 0], 0, w - 1)
-        quad_i[:, 1] = np.clip(quad_i[:, 1], 0, h - 1)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, quad_i, 255)
-
+        slices, mask = quad_mask_roi(hsv_img.shape, quad_xy)
+        hsv_roi = hsv_img[slices]
         valid = mask > 0
         count = int(np.count_nonzero(valid))
         if count < 80:
             return None
 
-        sat = hsv_img[:, :, 1][valid].astype(np.float32)
-        val = hsv_img[:, :, 2][valid].astype(np.float32)
+        sat = hsv_roi[:, :, 1][valid].astype(np.float32)
+        val = hsv_roi[:, :, 2][valid].astype(np.float32)
         sat_thr = float(np.clip(self.cfg.white_sat_max, 0, 255))
         val_thr = float(np.clip(self.cfg.white_value_min, 0, 255))
         white_mask = (sat <= sat_thr) & (val >= val_thr)
@@ -3974,50 +3309,6 @@ class D435Camera:
         self.lock_slot_quads[slot_idx] = quad.copy()
         self.lock_slot_depths[slot_idx] = None if depth_m is None else float(depth_m)
         return quad, depth_m
-
-    @staticmethod
-    def _align_quad_to_reference(quad_xy: np.ndarray, ref_xy: np.ndarray) -> np.ndarray:
-        q = quad_xy.astype(np.float32)
-        r = ref_xy.astype(np.float32)
-
-        candidates = []
-        for k in range(4):
-            candidates.append(np.roll(q, shift=k, axis=0))
-
-        q_rev = q[::-1].copy()
-        for k in range(4):
-            candidates.append(np.roll(q_rev, shift=k, axis=0))
-
-        best = candidates[0]
-        best_err = float(np.mean(np.sum((best - r) ** 2, axis=1)))
-        for cand in candidates[1:]:
-            err = float(np.mean(np.sum((cand - r) ** 2, axis=1)))
-            if err < best_err:
-                best = cand
-                best_err = err
-        return best
-
-    @staticmethod
-    def _quad_iou(quad_a: np.ndarray, quad_b: np.ndarray) -> float:
-        qa = quad_a.astype(np.float32).reshape((-1, 1, 2))
-        qb = quad_b.astype(np.float32).reshape((-1, 1, 2))
-        area_a = float(abs(cv2.contourArea(qa)))
-        area_b = float(abs(cv2.contourArea(qb)))
-        if area_a <= 1e-6 or area_b <= 1e-6:
-            return 0.0
-        inter_area, _ = cv2.intersectConvexConvex(qa, qb)
-        if inter_area <= 0.0:
-            return 0.0
-        union = area_a + area_b - float(inter_area)
-        if union <= 1e-6:
-            return 0.0
-        return float(inter_area / union)
-
-    @staticmethod
-    def _candidate_slot_key(cand) -> tuple[float, float]:
-        quad = cand["quad"].astype(np.float32)
-        center = np.mean(quad, axis=0)
-        return float(center[0]), float(center[1])
 
     def _solve_slot_candidate_assignment(self, slot_indices, candidate_indices, cand_centers, max_assign_dist_px: float):
         if not slot_indices or not candidate_indices:
@@ -4612,47 +3903,6 @@ class D435Camera:
         x1 = min(x0 + roi_w, w)
         y1 = min(y0 + roi_h, h)
         return img[y0:y1, x0:x1], (x0, y0, x1, y1)
-
-    @staticmethod
-    def _order_quad_points(pts: np.ndarray) -> np.ndarray:
-        center = np.mean(pts, axis=0)
-        angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
-        order = np.argsort(angles)
-        return pts[order]
-
-    @staticmethod
-    def _is_rectangular_quad(quad: np.ndarray, max_cos: float = 0.35) -> bool:
-        for i in range(4):
-            p_prev = quad[(i - 1) % 4]
-            p_curr = quad[i]
-            p_next = quad[(i + 1) % 4]
-
-            v1 = p_prev - p_curr
-            v2 = p_next - p_curr
-            denom = (np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-6
-            cos_angle = abs(float(np.dot(v1, v2) / denom))
-            if cos_angle > max_cos:
-                return False
-        return True
-
-    def _save_snapshot(self, color_img, depth_img, save_dir: str) -> None:
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        if color_img is not None:
-            color_path = os.path.join(save_dir, f"{stamp}_color.png")
-            cv2.imwrite(color_path, color_img)
-            log_save(f"컬러 이미지: {color_path}")
-        if depth_img is not None:
-            depth_png_path = os.path.join(save_dir, f"{stamp}_depth_raw.png")
-            depth_npy_path = os.path.join(save_dir, f"{stamp}_depth_raw.npy")
-            depth_vis_path = os.path.join(save_dir, f"{stamp}_depth_vis.png")
-
-            # Keep raw 16-bit depth for metric post-processing.
-            cv2.imwrite(depth_png_path, depth_img)
-            np.save(depth_npy_path, depth_img)
-            cv2.imwrite(depth_vis_path, self._depth_to_colormap(depth_img))
-            log_save(f"깊이 원본 이미지: {depth_png_path}")
-            log_save(f"깊이 원본 데이터: {depth_npy_path}")
-            log_save(f"깊이 확인용 이미지: {depth_vis_path}")
 
     def _cache_measure_intrinsics(self, profile) -> None:
         self.measure_intrinsics = None
@@ -5303,7 +4553,7 @@ def main() -> None:
 
     try:
         cam.start()
-        cam.preview(save_dir="captures")
+        cam.preview()
     finally:
         cam.stop()
 
