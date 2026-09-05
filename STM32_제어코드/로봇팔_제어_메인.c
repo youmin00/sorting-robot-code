@@ -723,6 +723,9 @@ void Run_Pipeline_Camera_Plans(void)
       if (command_override != COMMAND_NONE) goto aborted;
       Move_Both_Arms_Smooth(pick->j1,pick->lift[0],pick->lift[1],pick->lift[2], 90,120,56,0, SERVO_MOVE_DELAY_MS);
       Move_Both_Arms_Smooth(pick->j1,120,56,0, 90,120,56,0, SERVO_MOVE_DELAY_MS);
+      /* The picked object is lifted and the working joints are retracted.
+         Camera preparation may overlap only the remaining J1 return. */
+      Console_Write("CAMERA_CLEAR\r\n");
       Move_Both_Arms_Smooth(90,120,56,0, 90,120,56,0, SERVO_MOVE_DELAY_MS);
     }
     else
@@ -738,6 +741,9 @@ void Run_Pipeline_Camera_Plans(void)
       if (command_override != COMMAND_NONE) goto aborted;
       Move_Both_Arms_Smooth(90,120,56,0, pick->j1,pick->lift[0],pick->lift[1],pick->lift[2], SERVO_MOVE_DELAY_MS);
       Move_Both_Arms_Smooth(90,120,56,0, pick->j1,120,56,0, SERVO_MOVE_DELAY_MS);
+      /* The picked object is lifted and the working joints are retracted.
+         Camera preparation may overlap only the remaining J1 return. */
+      Console_Write("CAMERA_CLEAR\r\n");
       Move_Both_Arms_Smooth(90,120,56,0, 90,120,56,0, SERVO_MOVE_DELAY_MS);
     }
     if (command_override != COMMAND_NONE) goto aborted;
@@ -755,6 +761,8 @@ void Run_Pipeline_Camera_Plans(void)
   /* 반대쪽에 다음 물체가 없으면 현재 든 물체만 안전하게 놓고 양팔 로딩 복귀. */
   if (pick_arm == 0U)
   {
+    /* Both arms start this command at loading, clear of the work area. */
+    Console_Write("CAMERA_CLEAR\r\n");
     if (pipeline_holding_arm == 1U)
     {
       Move_Both_Arms_Smooth(carrier_place,120,56,0, 90,120,56,0, SERVO_MOVE_DELAY_MS);
@@ -797,6 +805,8 @@ void Run_Pipeline_Camera_Plans(void)
     if (command_override != COMMAND_NONE) goto aborted;
     Move_Both_Arms_Smooth(carrier_place,120,56,0, pick->j1,pick->lift[0],pick->lift[1],pick->lift[2], SERVO_MOVE_DELAY_MS);
     Move_Both_Arms_Smooth(carrier_place,120,56,0, pick->j1,120,56,0, SERVO_MOVE_DELAY_MS);
+    /* Both working joints are retracted; overlap only the final J1 return. */
+    Console_Write("CAMERA_CLEAR\r\n");
     Move_Both_Arms_Smooth(90,120,56,0, 90,120,56,0, SERVO_MOVE_DELAY_MS);
   }
   else
@@ -813,6 +823,8 @@ void Run_Pipeline_Camera_Plans(void)
     if (command_override != COMMAND_NONE) goto aborted;
     Move_Both_Arms_Smooth(pick->j1,pick->lift[0],pick->lift[1],pick->lift[2], carrier_place,120,56,0, SERVO_MOVE_DELAY_MS);
     Move_Both_Arms_Smooth(pick->j1,120,56,0, carrier_place,120,56,0, SERVO_MOVE_DELAY_MS);
+    /* Both working joints are retracted; overlap only the final J1 return. */
+    Console_Write("CAMERA_CLEAR\r\n");
     Move_Both_Arms_Smooth(90,120,56,0, 90,120,56,0, SERVO_MOVE_DELAY_MS);
   }
   if (command_override != COMMAND_NONE) goto aborted;

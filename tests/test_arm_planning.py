@@ -128,8 +128,8 @@ class ArmInverseKinematicsTests(unittest.TestCase):
 
 
 class ArmSerialSafetyTests(unittest.TestCase):
-    def test_hardware_safe_byte_delay_default_is_unchanged(self):
-        self.assertEqual(0.020, program.ARM_SERIAL_BYTE_DELAY_SEC)
+    def test_hardware_safe_byte_delay_uses_second_staged_setting(self):
+        self.assertEqual(0.012, program.ARM_SERIAL_BYTE_DELAY_SEC)
 
     def test_dual_arm_command_is_unchanged(self):
         program._ARM_PLAN_CACHE.clear()

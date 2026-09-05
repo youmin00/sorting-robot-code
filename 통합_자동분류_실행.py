@@ -66,6 +66,16 @@ from sorting_robot.arm_planning import (
     plan_in_center_risk_zone,
 )
 from sorting_robot.vision_display import depth_to_colormap
+from sorting_robot.session_statistics import (
+    REMOVED,
+    STILL_PRESENT,
+    SessionStatistics,
+    PickTarget,
+    render_statistics_panel,
+    scene_objects_from_dicts,
+    targets_from_plans,
+    verify_pick_targets,
+)
 from sorting_robot.vision_geometry import (
     align_quad_to_reference,
     candidate_slot_key,
@@ -85,7 +95,7 @@ AUTO_START_CONVEYOR = False
 
 CAMERA_SETTLE_SEC = 1.2
 CAMERA_SETTLE_FRAMES = 6
-CAMERA_INITIAL_EMPTY_GRACE_SEC = 1.0
+CAMERA_INITIAL_EMPTY_GRACE_SEC = 1.25
 CAMERA_REACQUIRE_MAX_SEC = 0.8
 CAMERA_REACQUIRE_STABLE_FRAMES = 5
 CAMERA_STABLE_POSITION_TOLERANCE_MM = 2.0
@@ -134,8 +144,40 @@ def scene_positions_stable(
     return True
 
 
+def scene_robot_xy_positions(
+    objects: list[dict],
+) -> Optional[list[tuple[float, float]]]:
+    """Return robot XY positions, or None when any detected object is incomplete."""
+    positions: list[tuple[float, float]] = []
+    for obj in objects:
+        if obj.get("robot_x_mm") is None or obj.get("robot_y_mm") is None:
+            return None
+        positions.append((float(obj["robot_x_mm"]), float(obj["robot_y_mm"])))
+    return positions
+
+
+def empty_scene_ready_after_grace(
+    has_tracked_objects: bool,
+    now: float,
+    window_started_at: float,
+    last_object_evidence_at: Optional[float],
+    grace_sec: float,
+) -> bool:
+    """Do not declare EMPTY soon after even a brief object candidate was seen."""
+    if has_tracked_objects:
+        return True
+    grace_sec = max(0.0, float(grace_sec))
+    if now - window_started_at < grace_sec:
+        return False
+    return (
+        last_object_evidence_at is None
+        or now - last_object_evidence_at >= grace_sec
+    )
+
+
 def send_arm_plan(arm_ser, plan: dict) -> None:
-    write_arm_line(arm_ser, _build_single_arm_line(plan))
+    command = _build_single_arm_line(plan)
+    write_arm_line(arm_ser, command)
     log_status(
         f"로봇팔 전송: {plan['size']} mm, Camera X={plan['camera_x']:.1f}, "
         f"Y={plan['camera_y']:.1f} mm, 추가 하강={plan['edge_extra_drop']:.1f} mm",
@@ -149,10 +191,8 @@ def send_dual_arm_plans(
     right_plan: Optional[dict],
     sequential: bool = True,
 ) -> None:
-    write_arm_line(
-        arm_ser,
-        _build_dual_arm_line(left_plan, right_plan, sequential=sequential),
-    )
+    command = _build_dual_arm_line(left_plan, right_plan, sequential=sequential)
+    write_arm_line(arm_ser, command)
     sides = []
     if left_plan is not None:
         sides.append(f"왼팔 {left_plan['size']}mm")
@@ -207,6 +247,8 @@ def wait_arm_reply(
         if emergency_requested:
             if reply == "EMERGENCY_DONE":
                 return "EMERGENCY"
+            continue
+        if reply == "PLAN_OK":
             continue
         if reply == "CAMERA_CLEAR":
             if camera_clear_callback is not None:
@@ -324,6 +366,10 @@ class D435Camera:
         self.last_selected_candidates = []
         self.last_tracked_objects = []
         self.prefetched_scene_ready = False
+        self.prefetched_scene_positions: Optional[list[tuple[float, float]]] = None
+        self.sorting_statistics = SessionStatistics()
+        self.statistics_panel_cache: Optional[np.ndarray] = None
+        self.statistics_snapshot_cache: Optional[tuple] = None
         self.preserve_sort_slots = False
         self.reserved_sort_slot_ids: set[int] = set()
         self.last_contour_mode = ""
@@ -397,31 +443,46 @@ class D435Camera:
         position_tolerance_mm: float = CAMERA_STABLE_POSITION_TOLERANCE_MM,
         empty_grace_sec: float = 0.0,
     ) -> list[dict]:
+        wait_started_at = time.time()
+        last_object_evidence_at: Optional[float] = None
+        stable_reference = None
+        stable_count = 0
+        latest_objects: list[dict] = []
+        observed_frames = 0
+        last_instability_reason = "안정 프레임 수 부족"
+
         while True:
-            window_started_at = time.time()
-            deadline = time.time() + max(0.1, float(max_wait_sec))
-            stable_reference = None
-            stable_count = 0
-            latest_objects: list[dict] = []
-            observed_frames = 0
+            warning_window_started_at = time.time()
+            deadline = warning_window_started_at + max(
+                0.1,
+                float(max_wait_sec),
+                float(empty_grace_sec),
+            )
+            window_observed_frames = 0
 
             # Detection can run below 5 FPS with several objects. Always inspect at
             # least the requested number of frames before declaring instability;
-            # otherwise a short wall-clock window produces a false warning.
+            # otherwise a short wall-clock window produces a false warning. Keep
+            # already-confirmed consecutive stable frames when only the warning
+            # window expires, so safe progress is not discarded and recounted.
             while (
                 time.time() < deadline
-                or observed_frames < max(1, int(required_stable_frames))
+                or window_observed_frames < max(1, int(required_stable_frames))
             ):
                 color_img, depth_img = self.get_frames()
                 display = self._compose_display(color_img, depth_img)
                 observed_frames += 1
+                window_observed_frames += 1
                 self._draw_runtime_mode_banner(display)
-                cv2.imshow("D435 Preview", display)
+                self._show_preview_and_statistics(display)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q"), ord("x"), ord("z")):
                     raise RuntimeControlKey(key)
 
                 latest_objects = [dict(obj) for obj in self.last_tracked_objects]
+                now = time.time()
+                if latest_objects or self.last_selected_candidates:
+                    last_object_evidence_at = now
                 current = []
                 coordinates_valid = True
                 for obj in latest_objects:
@@ -446,12 +507,35 @@ class D435Camera:
                 if scene_stable:
                     stable_count += 1
                 else:
+                    if not coordinates_valid:
+                        last_instability_reason = "로봇 좌표 계산 미완료"
+                    elif stable_reference is None:
+                        last_instability_reason = "첫 좌표 기준 수집"
+                    elif len(stable_reference) != len(current):
+                        last_instability_reason = (
+                            f"물체 수 변화 {len(stable_reference)}→{len(current)}"
+                        )
+                    elif stable_reference:
+                        max_nearest_delta = max(
+                            min(
+                                float(np.hypot(now_x - ref_x, now_y - ref_y))
+                                for now_x, now_y in current
+                            )
+                            for ref_x, ref_y in stable_reference
+                        )
+                        last_instability_reason = (
+                            f"좌표 변화 {max_nearest_delta:.2f}mm "
+                            f"> {position_tolerance_mm:.2f}mm"
+                        )
                     stable_reference = current if coordinates_valid else None
                     stable_count = 1 if coordinates_valid else 0
 
-                empty_grace_complete = (
-                    bool(current)
-                    or (time.time() - window_started_at) >= max(0.0, float(empty_grace_sec))
+                empty_grace_complete = empty_scene_ready_after_grace(
+                    bool(current),
+                    now,
+                    wait_started_at,
+                    last_object_evidence_at,
+                    empty_grace_sec,
                 )
                 if (
                     stable_count >= max(1, int(required_stable_frames))
@@ -459,15 +543,15 @@ class D435Camera:
                 ):
                     return latest_objects
 
-            log_warning("물체 중심좌표가 아직 흔들려 로봇 명령을 보류하고 다시 확인합니다.")
+            log_warning(
+                "물체 중심좌표가 아직 흔들려 로봇 명령을 보류하고 다시 확인합니다. "
+                f"(원인: {last_instability_reason}, "
+                f"안정 {stable_count}/{max(1, int(required_stable_frames))}프레임, "
+                f"관찰 {observed_frames}프레임)"
+            )
 
-    def _prefetch_scene_while_arms_place(self) -> None:
-        self.prefetched_scene_ready = False
-        self._reset_tracking_state()
-        objects = self._wait_for_stable_scene(
-            CAMERA_REACQUIRE_MAX_SEC,
-            CAMERA_REACQUIRE_STABLE_FRAMES,
-        )
+    @staticmethod
+    def _warm_arm_plan_cache(objects: list[dict]) -> None:
         for obj in objects:
             if (
                 obj.get("robot_x_mm") is None
@@ -482,11 +566,136 @@ class D435Camera:
                     build_arm_pick_plan(obj, "right")
             except ValueError:
                 continue
+
+    def _prepare_next_scene(self, completion_message: str) -> None:
+        started_at = time.perf_counter()
+        self.prefetched_scene_ready = False
+        self.prefetched_scene_positions = None
+        self._reset_tracking_state()
+        objects = self._wait_for_stable_scene(
+            CAMERA_REACQUIRE_MAX_SEC,
+            CAMERA_REACQUIRE_STABLE_FRAMES,
+        )
+        self._warm_arm_plan_cache(objects)
+        self.prefetched_scene_positions = scene_robot_xy_positions(objects)
         self.prefetched_scene_ready = True
         log_status(
-            "양팔이 물체를 놓는 동안 다음 작업영역 촬영과 IK 준비를 완료했습니다.",
+            f"{completion_message} ({time.perf_counter() - started_at:.3f}초)",
             PHASE_DETECTING,
         )
+
+    def _prefetch_scene_while_arms_place(self) -> None:
+        self._prepare_next_scene(
+            "양팔이 물체를 놓는 동안 다음 작업영역 촬영과 IK 준비를 완료했습니다."
+        )
+
+    def _prepare_scene_after_pipeline_step(self) -> None:
+        self._prepare_next_scene(
+            "교차 순차 팔의 로딩 복귀 후 다음 작업영역 촬영과 IK 준비를 완료했습니다."
+        )
+
+    def _prefetch_scene_while_pipeline_returns(self) -> None:
+        self._prepare_next_scene(
+            "교차 순차 팔이 안전 위치로 복귀하는 동안 다음 작업영역 촬영과 IK 준비를 완료했습니다."
+        )
+
+    def _confirm_pipeline_prefetch_after_return(self) -> bool:
+        """Confirm an overlapped prefetch with one fresh post-return camera frame."""
+        reference = self.prefetched_scene_positions
+        if not self.prefetched_scene_ready or reference is None:
+            return False
+
+        started_at = time.perf_counter()
+        color_img, depth_img = self.get_frames()
+        display = self._compose_display(color_img, depth_img)
+        self._draw_runtime_mode_banner(display)
+        self._show_preview_and_statistics(display)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord("q"), ord("x"), ord("z")):
+            raise RuntimeControlKey(key)
+
+        latest_objects = [dict(obj) for obj in self.last_tracked_objects]
+        current = scene_robot_xy_positions(latest_objects)
+        if current is None or not scene_positions_stable(
+            reference,
+            current,
+            CAMERA_STABLE_POSITION_TOLERANCE_MM,
+        ):
+            log_warning(
+                "복귀 후 최종 카메라 좌표가 미리 준비한 좌표와 일치하지 않아 "
+                "기존 방식으로 다시 확인합니다."
+            )
+            self.prefetched_scene_ready = False
+            self.prefetched_scene_positions = None
+            return False
+
+        self._warm_arm_plan_cache(latest_objects)
+        self.prefetched_scene_ready = False
+        self.prefetched_scene_positions = None
+        log_status(
+            "로봇 동작 완료 후 최종 카메라 확인이 2mm 이내로 일치하여 "
+            f"미리 준비한 결과를 사용합니다. ({time.perf_counter() - started_at:.3f}초)",
+            PHASE_DETECTING,
+        )
+        return True
+
+    def _complete_pipeline_scene_after_return(self) -> None:
+        if self._confirm_pipeline_prefetch_after_return():
+            return
+        self._prepare_scene_after_pipeline_step()
+
+    def _show_preview_and_statistics(self, display: np.ndarray) -> None:
+        """Refresh both OpenCV windows without adding another waitKey call."""
+        self.sorting_statistics.set_current_detected(len(self.last_tracked_objects))
+        snapshot = self.sorting_statistics.snapshot()
+        if self.statistics_panel_cache is None or snapshot != self.statistics_snapshot_cache:
+            self.statistics_panel_cache = render_statistics_panel(
+                snapshot,
+                self.ui_font_path,
+            )
+            self.statistics_snapshot_cache = snapshot
+            cv2.imshow("Sorting Statistics", self.statistics_panel_cache)
+        cv2.imshow("D435 Preview", display)
+
+    def _verify_camera_pick(
+        self,
+        before_objects: list[dict],
+        targets: list[PickTarget],
+    ):
+        before_scene, before_complete = scene_objects_from_dicts(before_objects)
+        after_objects = [dict(obj) for obj in self.last_tracked_objects]
+        after_scene, after_complete = scene_objects_from_dicts(after_objects)
+        summary = verify_pick_targets(
+            before_scene,
+            after_scene,
+            targets,
+            scene_complete=before_complete and after_complete,
+        )
+        for outcome in summary.outcomes:
+            side_name = "왼팔" if outcome.target.arm == "left" else "오른팔"
+            if outcome.status == REMOVED:
+                log_status(
+                    f"{side_name} {outcome.target.size_mm}mm 대상이 작업영역에서 "
+                    "사라진 것을 카메라로 확인했습니다.",
+                    PHASE_DONE,
+                )
+            elif outcome.status == STILL_PRESENT:
+                log_warning(
+                    f"{side_name} {outcome.target.size_mm}mm 대상이 원래 위치에 남아 있어 "
+                    "분류 성공 개수에 포함하지 않습니다."
+                )
+            else:
+                log_warning(
+                    f"{side_name} {outcome.target.size_mm}mm 대상의 이동 여부가 불확실하여 "
+                    "분류 성공 개수에 포함하지 않습니다."
+                )
+        if summary.newly_visible:
+            log_status(
+                f"이전에 보이지 않던 물체 또는 이동한 물체 {summary.newly_visible}개가 "
+                "확인되었습니다. 새 물체는 실제 집기 성공 후에만 통계에 반영합니다.",
+                PHASE_DETECTING,
+            )
+        return summary
 
     def preview(self) -> None:
         ser = None
@@ -521,6 +730,14 @@ class D435Camera:
         log_status("카메라·컨베이어·로봇팔 통합 모드입니다.")
         log_status("프리뷰 실행 중입니다. 종료하려면 q 또는 ESC를 누르세요.")
         cv2.namedWindow("D435 Preview", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Sorting Statistics", cv2.WINDOW_NORMAL)
+        initial_statistics = render_statistics_panel(
+            self.sorting_statistics.snapshot(),
+            self.ui_font_path,
+        )
+        self.statistics_panel_cache = initial_statistics
+        self.statistics_snapshot_cache = self.sorting_statistics.snapshot()
+        cv2.imshow("Sorting Statistics", initial_statistics)
         wait_fail_count = 0
         wait_h = max(self.cfg.height, 360)
         wait_w = (
@@ -530,6 +747,8 @@ class D435Camera:
         )
         wait_w = max(wait_w, 640)
         wait_screen = np.zeros((wait_h, wait_w, 3), dtype=np.uint8)
+        cycle_started_at: Optional[float] = None
+        cycle_success_started_at = self.sorting_statistics.successful
 
         while True:
             forced_key = None
@@ -542,6 +761,8 @@ class D435Camera:
                     msg = ser.readline().decode(errors="ignore").strip()
 
                     if msg == "CHECK":
+                        cycle_started_at = time.perf_counter()
+                        cycle_success_started_at = self.sorting_statistics.successful
                         self.detection_overlay_enabled = True
                         log_status(
                             f"검사 요청을 받았습니다. 좌표 안정 시 즉시 진행하며 "
@@ -566,6 +787,12 @@ class D435Camera:
                             CAMERA_SETTLE_FRAMES,
                             empty_grace_sec=CAMERA_INITIAL_EMPTY_GRACE_SEC,
                         )
+                        if cycle_started_at is not None:
+                            log_status(
+                                f"[시간] 카메라 좌표 안정화: "
+                                f"{time.perf_counter() - cycle_started_at:.3f}초",
+                                PHASE_DETECTING,
+                            )
                         initial_valid_objects = [
                             obj for obj in objects
                             if obj.get("robot_x_mm") is not None
@@ -679,10 +906,19 @@ class D435Camera:
                                         )
                                     else:
                                         left_plan, right_plan = candidate_left, candidate_right
+                                    attempt_before_objects = [dict(obj) for obj in current_objects]
+                                    attempt_targets = targets_from_plans(left_plan, right_plan)
+                                    self.sorting_statistics.begin_attempt(
+                                        attempt_targets,
+                                        sequential=use_sequential,
+                                    )
                                     self.prefetched_scene_ready = False
+                                    self.prefetched_scene_positions = None
+                                    arm_batch_started_at = time.perf_counter()
                                     send_dual_arm_plans(
                                         arm_ser, left_plan, right_plan, sequential=use_sequential
                                     )
+                                    plan_send_elapsed = time.perf_counter() - arm_batch_started_at
                                     log_status(
                                         "교차 순차제어 완료 응답을 기다립니다."
                                         if use_sequential else "양팔 동시 작업 완료 응답을 기다립니다.",
@@ -696,66 +932,108 @@ class D435Camera:
                                     reply = wait_arm_reply(
                                         arm_ser, expected, conveyor_ser=ser,
                                         camera_clear_callback=(
+                                            self._prefetch_scene_while_pipeline_returns
+                                            if use_sequential else
                                             self._prefetch_scene_while_arms_place
-                                            if not use_sequential else None
                                         ),
+                                    )
+                                    log_status(
+                                        f"[시간] 로봇팔 계획 전송 {plan_send_elapsed:.3f}초, "
+                                        f"전송부터 완료 응답까지 "
+                                        f"{time.perf_counter() - arm_batch_started_at:.3f}초",
+                                        PHASE_SORTING,
                                     )
                                     if (use_sequential and reply not in ("HOLDING", "CROSS_DONE", "PLACED")) or (
                                         not use_sequential and reply != "DONE"
                                     ):
                                         log_warning(f"교차 순차제어가 완료되지 않았습니다: {reply or '응답 없음'}")
+                                        self.sorting_statistics.record_motion_error()
                                         if reply is None:
                                             hold_system_on_arm_fault(ser, "로봇팔 응답 시간 초과")
                                         break
                                     if not use_sequential:
-                                        processed_count += int(left_plan is not None) + int(right_plan is not None)
                                         holding_side = None
                                         preferred_side = "right" if preferred_side == "left" else "left"
-                                        if not self.prefetched_scene_ready:
-                                            self._reset_tracking_state()
-                                            self._wait_for_stable_scene(
-                                                CAMERA_REACQUIRE_MAX_SEC,
-                                                CAMERA_REACQUIRE_STABLE_FRAMES,
-                                            )
+                                        # DONE 뒤 최신 한 프레임으로 미리 촬영 결과를 확인한다.
+                                        # 놓는 도중 떨어진 물체가 다시 보이면 안정 장면을 재측정한다.
+                                        self._complete_pipeline_scene_after_return()
+                                        verification = self._verify_camera_pick(
+                                            attempt_before_objects,
+                                            attempt_targets,
+                                        )
+                                        success_before = self.sorting_statistics.successful
+                                        self.sorting_statistics.record_completed_pick(verification)
+                                        processed_count += (
+                                            self.sorting_statistics.successful - success_before
+                                        )
                                         self.prefetched_scene_ready = False
+                                        self.prefetched_scene_positions = None
                                         continue
                                     sent_side = "left" if left_plan is not None else (
                                         "right" if right_plan is not None else None
                                     )
+                                    # 복귀 중 미리 본 장면을 완료 직후 한 프레임으로 다시
+                                    # 확인한다. 불일치하면 기존 전체 재측정으로 복귀한다.
+                                    self._complete_pipeline_scene_after_return()
                                     if reply == "HOLDING":
                                         holding_side = sent_side
+                                        verification = self._verify_camera_pick(
+                                            attempt_before_objects,
+                                            attempt_targets,
+                                        )
+                                        self.sorting_statistics.record_holding_pick(verification)
                                     elif reply == "CROSS_DONE":
-                                        processed_count += 1
+                                        success_before = self.sorting_statistics.successful
+                                        self.sorting_statistics.complete_holding()
+                                        processed_count += (
+                                            self.sorting_statistics.successful - success_before
+                                        )
                                         holding_side = sent_side
                                         preferred_side = "right" if sent_side == "left" else "left"
+                                        verification = self._verify_camera_pick(
+                                            attempt_before_objects,
+                                            attempt_targets,
+                                        )
+                                        self.sorting_statistics.record_holding_pick(verification)
                                     else:
-                                        processed_count += 1
+                                        success_before = self.sorting_statistics.successful
+                                        self.sorting_statistics.complete_holding()
+                                        processed_count += (
+                                            self.sorting_statistics.successful - success_before
+                                        )
                                         holding_side = None
-
-                                    # 피킹 전 프레임을 버리고 실제 작업영역을 다시 측정
-                                    self._reset_tracking_state()
-                                    self._wait_for_stable_scene(
-                                        CAMERA_REACQUIRE_MAX_SEC,
-                                        CAMERA_REACQUIRE_STABLE_FRAMES,
-                                    )
                                     continue
 
                                 if holding_side is not None:
+                                    self.prefetched_scene_ready = False
+                                    self.prefetched_scene_positions = None
+                                    arm_batch_started_at = time.perf_counter()
                                     send_dual_arm_plans(arm_ser, None, None)
+                                    plan_send_elapsed = time.perf_counter() - arm_batch_started_at
                                     reply = wait_arm_reply(
-                                        arm_ser, ("PLACED", "ERROR", "BUSY"), conveyor_ser=ser
+                                        arm_ser,
+                                        ("PLACED", "ERROR", "BUSY"),
+                                        conveyor_ser=ser,
+                                        camera_clear_callback=self._prefetch_scene_while_pipeline_returns,
+                                    )
+                                    log_status(
+                                        f"[시간] 마지막 놓기 명령 전송 {plan_send_elapsed:.3f}초, "
+                                        f"전송부터 완료 응답까지 "
+                                        f"{time.perf_counter() - arm_batch_started_at:.3f}초",
+                                        PHASE_SORTING,
                                     )
                                     if reply != "PLACED":
                                         log_warning("마지막 보유 물체 놓기에 실패했습니다.")
+                                        self.sorting_statistics.record_motion_error()
                                         if reply is None:
                                             hold_system_on_arm_fault(ser, "마지막 놓기 응답 시간 초과")
                                         break
-                                    processed_count += 1
                                     holding_side = None
-                                    self._reset_tracking_state()
-                                    self._wait_for_stable_scene(
-                                        CAMERA_REACQUIRE_MAX_SEC,
-                                        CAMERA_REACQUIRE_STABLE_FRAMES,
+                                    self._complete_pipeline_scene_after_return()
+                                    success_before = self.sorting_statistics.successful
+                                    self.sorting_statistics.complete_holding()
+                                    processed_count += (
+                                        self.sorting_statistics.successful - success_before
                                     )
                                     continue
 
@@ -799,6 +1077,22 @@ class D435Camera:
                                             "다음 작업구역 벽에서 다시 정지합니다.",
                                             PHASE_BELT_MOVING,
                                         )
+                                        if cycle_started_at is not None:
+                                            cycle_elapsed = time.perf_counter() - cycle_started_at
+                                            verified_in_cycle = (
+                                                self.sorting_statistics.successful
+                                                - cycle_success_started_at
+                                            )
+                                            self.sorting_statistics.finish_cycle(
+                                                cycle_elapsed,
+                                                verified_in_cycle,
+                                            )
+                                            log_status(
+                                                f"[시간] 검사 요청부터 컨베이어 재시작까지: "
+                                                f"{cycle_elapsed:.3f}초",
+                                                PHASE_BELT_MOVING,
+                                            )
+                                            cycle_started_at = None
                                         break
 
                                 # 마지막 분류 후 연속 프레임으로 작업영역이 정말 비었는지 재확인
@@ -808,7 +1102,7 @@ class D435Camera:
                                     color_img, depth_img = self.get_frames()
                                     display = self._compose_display(color_img, depth_img)
                                     self._draw_runtime_mode_banner(display)
-                                    cv2.imshow("D435 Preview", display)
+                                    self._show_preview_and_statistics(display)
                                     control_key = cv2.waitKey(1) & 0xFF
                                     if control_key in (27, ord("q"), ord("x"), ord("z")):
                                         raise RuntimeControlKey(control_key)
@@ -822,10 +1116,27 @@ class D435Camera:
                                 ser.write(b"E\n")
                                 ser.flush()
                                 log_status(
-                                    f"총 {processed_count}개 분류 후 EMPTY를 확인하여 "
+                                    f"카메라 확인 성공 {processed_count}개, EMPTY를 확인하여 "
                                     "컨베이어 재시작 신호 E를 보냈습니다.",
                                     PHASE_BELT_MOVING,
                                 )
+                                if cycle_started_at is not None:
+                                    cycle_elapsed = time.perf_counter() - cycle_started_at
+                                    verified_in_cycle = (
+                                        self.sorting_statistics.successful
+                                        - cycle_success_started_at
+                                    )
+                                    self.sorting_statistics.finish_cycle(
+                                        cycle_elapsed,
+                                        verified_in_cycle,
+                                    )
+                                    log_status(
+                                        f"[시간] 검사 요청부터 컨베이어 재시작까지: "
+                                        f"{cycle_elapsed:.3f}초 "
+                                        f"(카메라 확인 성공 {processed_count}개)",
+                                        PHASE_BELT_MOVING,
+                                    )
+                                    cycle_started_at = None
                                 self.preserve_sort_slots = False
                                 self.reserved_sort_slot_ids.clear()
                                 self.detection_overlay_enabled = False
@@ -845,6 +1156,14 @@ class D435Camera:
                             ser.write(b"E\n")
                             ser.flush()
                             log_status("STM32에 컨베이어 재시작 신호를 보냈습니다.", PHASE_BELT_MOVING)
+                            if cycle_started_at is not None:
+                                log_status(
+                                    f"[시간] 검사 요청부터 컨베이어 재시작까지: "
+                                    f"{time.perf_counter() - cycle_started_at:.3f}초 "
+                                    "(분류 대상 없음)",
+                                    PHASE_BELT_MOVING,
+                                )
+                                cycle_started_at = None
                             self.detection_overlay_enabled = False
             except RuntimeControlKey as control:
                 forced_key = control.key
@@ -874,12 +1193,13 @@ class D435Camera:
                     cv2.LINE_AA,
                 )
             self._draw_runtime_mode_banner(display)
-            cv2.imshow("D435 Preview", display)
+            self._show_preview_and_statistics(display)
 
             key = forced_key if forced_key is not None else (cv2.waitKey(1) & 0xFF)
             if key in (27, ord("q")):
                 break
             if key == ord("x"):
+                self.sorting_statistics.cancel_pending()
                 request_emergency_stop(arm_ser, ser)
                 if arm_ser is not None:
                     wait_arm_reply(
@@ -889,6 +1209,7 @@ class D435Camera:
                 log_warning("긴급 정지가 완료되었습니다. 컨베이어는 정지 상태입니다.")
                 continue
             if key == ord("z"):
+                self.sorting_statistics.cancel_pending()
                 log_status("Z 리셋을 시작합니다. 전체 동작을 처음 상태로 되돌립니다.", PHASE_SYSTEM)
 
                 # 재시작 중 벨트가 움직이지 않도록 자동 모드를 먼저 정지
@@ -4549,6 +4870,10 @@ def parse_args() -> CameraConfig:
 
 def main() -> None:
     cfg = parse_args()
+    log_status(
+        f"로봇팔 통신 간격: {ARM_SERIAL_BYTE_DELAY_SEC * 1000.0:.1f}ms "
+        "(관절 속도·동작 순서 변경 없음)"
+    )
     cam = D435Camera(cfg)
 
     try:

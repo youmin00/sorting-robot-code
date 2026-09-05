@@ -30,6 +30,38 @@ program = load_program()
 
 
 class SyntheticDetectionRegressionTests(unittest.TestCase):
+    def test_pipeline_prefetch_positions_require_complete_and_stable_xy(self):
+        positions = program.scene_robot_xy_positions
+        stable = program.scene_positions_stable
+
+        reference = positions([
+            {"robot_x_mm": -20.0, "robot_y_mm": 40.0},
+            {"robot_x_mm": 25.0, "robot_y_mm": 55.0},
+        ])
+        reordered_close = positions([
+            {"robot_x_mm": 25.8, "robot_y_mm": 54.4},
+            {"robot_x_mm": -19.2, "robot_y_mm": 40.6},
+        ])
+        moved = positions([
+            {"robot_x_mm": -16.0, "robot_y_mm": 40.0},
+            {"robot_x_mm": 25.0, "robot_y_mm": 55.0},
+        ])
+
+        self.assertIsNotNone(reference)
+        self.assertIsNotNone(reordered_close)
+        self.assertTrue(stable(reference, reordered_close, 2.0))
+        self.assertFalse(stable(reference, moved, 2.0))
+        self.assertIsNone(positions([{"robot_x_mm": 1.0, "robot_y_mm": None}]))
+
+    def test_empty_scene_waits_after_brief_object_evidence(self):
+        ready = program.empty_scene_ready_after_grace
+
+        self.assertFalse(ready(False, 1.0, 0.0, None, 1.25))
+        self.assertTrue(ready(False, 1.25, 0.0, None, 1.25))
+        self.assertFalse(ready(False, 2.0, 0.0, 1.0, 1.25))
+        self.assertTrue(ready(False, 2.25, 0.0, 1.0, 1.25))
+        self.assertTrue(ready(True, 0.1, 0.0, 0.1, 1.25))
+
     def test_two_object_scene_is_unchanged(self):
         config = program.CameraConfig(center_roi_only=False, show_depth_panel=False)
         camera = program.D435Camera(config)
