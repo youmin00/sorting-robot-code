@@ -10,7 +10,7 @@ Controls:
   s       : start conveyor automatic workflow
   x       : emergency stop
   z       : reset camera/robot/conveyor workflow from the beginning
-  p       : send the nearest detected cube to the robot arm
+  p       : move both robot arms to the loading pose (90/120/56/0)
 """
 
 from __future__ import annotations
