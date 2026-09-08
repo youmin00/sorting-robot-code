@@ -7,13 +7,9 @@ Usage:
 
 Controls:
   q / ESC : quit
-  s       : save current frame(s)
-  r       : toggle rectangle-corner overlay
-  c       : toggle center-ROI mode
-  w       : toggle white-weight scoring mode
-  d       : toggle depth preview panel
-  l       : clear coordinate locks and re-acquire objects
-  p       : send the nearest detected cube to the robot arm
+  x       : emergency stop
+  z       : reset the camera and both robot arms
+  p       : start automatic sorting of detected reachable cubes
 """
 
 from __future__ import annotations
