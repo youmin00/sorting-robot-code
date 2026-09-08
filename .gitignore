@@ -17,6 +17,7 @@ captures/
 # 로컬에서만 사용하는 설정
 .openai/
 .agents/
+.vscode/launch.json
 
 # Intel에서 다시 받을 수 있는 공식 실행 도구
 도구/RealSense_공식도구/*.exe
