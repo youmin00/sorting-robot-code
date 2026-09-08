@@ -1,0 +1,3 @@
+# Keep browser-based simulators in the repository without letting their
+# generated HTML dominate GitHub's language statistics.
+시뮬레이터/**/*.html linguist-detectable=false
