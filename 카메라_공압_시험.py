@@ -286,7 +286,9 @@ def send_dual_arm_plans(arm_ser, left_plan: Optional[dict], right_plan: Optional
     values.extend(_plan_values(left_plan))
     values.append(1.0 if right_plan is not None else 0.0)
     values.extend(_plan_values(right_plan))
-    line = "D," + ",".join(f"{value:.1f}" for value in values) + "\n"
+    # Current firmware reserves D for the one-arm-at-a-time cross pipeline.
+    # This test waits for DONE and may send both plans, so it must use M.
+    line = "M," + ",".join(f"{value:.1f}" for value in values) + "\n"
     write_arm_line(arm_ser, line)
     sides = []
     if left_plan is not None:
@@ -314,14 +316,21 @@ def wait_arm_reply(
     allow_emergency_key: bool = True,
 ) -> Optional[str]:
     deadline = time.time() + timeout_sec
+    emergency_requested = False
     while time.time() < deadline:
         if allow_emergency_key and (cv2.waitKey(1) & 0xFF) == ord("x"):
             request_emergency_stop(arm_ser)
-            return "EMERGENCY"
+            emergency_requested = True
+            allow_emergency_key = False
+            deadline = time.time() + 60.0
         reply = arm_ser.readline().decode("utf-8", errors="replace").strip()
         if not reply:
             continue
         log_status(f"로봇팔: {reply}", PHASE_SORTING)
+        if emergency_requested:
+            if reply == "EMERGENCY_DONE":
+                return "EMERGENCY"
+            continue
         if reply in final_replies:
             return reply
     log_warning("로봇팔 응답 시간이 초과되었습니다.")

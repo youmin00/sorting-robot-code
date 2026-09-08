@@ -6,19 +6,21 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROGRAM_PATH = PROJECT_ROOT / "통합_자동분류_실행.py"
+CAMERA_TEST_PATH = PROJECT_ROOT / "카메라_공압_시험.py"
+RIGHT_ARM_TEST_PATH = PROJECT_ROOT / "오른팔_동작_시험.py"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def load_program():
-    spec = importlib.util.spec_from_file_location("integrated_sorting", PROGRAM_PATH)
+def load_program(path=PROGRAM_PATH, module_name="integrated_sorting"):
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"프로그램을 불러올 수 없습니다: {PROGRAM_PATH}")
     module = importlib.util.module_from_spec(spec)
@@ -28,6 +30,8 @@ def load_program():
 
 
 program = load_program()
+camera_test = load_program(CAMERA_TEST_PATH, "camera_pneumatic_test")
+right_arm_test = load_program(RIGHT_ARM_TEST_PATH, "right_arm_motion_test")
 
 
 def scalar_reference_ik(
@@ -146,6 +150,44 @@ class ArmSerialSafetyTests(unittest.TestCase):
             "1,30,90,73.5,38,29,70,41.5,36,70,42,35,72,40,28\n",
             program._build_dual_arm_line(left, right, sequential=False),
         )
+
+    def test_camera_test_uses_simultaneous_firmware_command(self):
+        plan = {
+            "size": 30,
+            "approach": {"j1": 90, "j2": 120, "j3": 56, "j4": 0},
+            "contact": {"j2": 119, "j3": 57, "j4": 1},
+            "preload": {"j2": 118, "j3": 58, "j4": 2},
+            "lift": {"j2": 120, "j3": 56, "j4": 0},
+            "arm": "left",
+        }
+        with patch.object(camera_test, "write_arm_line") as write_line:
+            camera_test.send_dual_arm_plans(Mock(), plan, plan)
+
+        command = write_line.call_args.args[1]
+        self.assertTrue(command.startswith("M,"))
+        self.assertEqual(31, len(command.rstrip("\n").split(",")))
+
+    def test_camera_test_waits_for_emergency_acknowledgement(self):
+        arm_ser = Mock()
+        arm_ser.readline.side_effect = [b"", b"EMERGENCY_DONE\r\n"]
+
+        with (
+            patch.object(camera_test.cv2, "waitKey", return_value=ord("x")),
+            patch.object(camera_test, "request_emergency_stop") as stop,
+        ):
+            result = camera_test.wait_arm_reply(arm_ser, ("DONE",), timeout_sec=1.0)
+
+        stop.assert_called_once_with(arm_ser)
+        self.assertEqual("EMERGENCY", result)
+
+    def test_right_arm_test_accepts_emergency_completion(self):
+        arm_ser = Mock()
+        arm_ser.readline.return_value = b"EMERGENCY_DONE\r\n"
+
+        with patch.object(right_arm_test.msvcrt, "kbhit", return_value=False):
+            result = right_arm_test.wait_for_result(arm_ser)
+
+        self.assertEqual("EMERGENCY_DONE", result)
 
 
 class DisplayPerformanceTests(unittest.TestCase):

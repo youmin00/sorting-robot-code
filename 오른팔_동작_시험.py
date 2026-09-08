@@ -65,7 +65,7 @@ def wait_for_result(ser: serial.Serial) -> str | None:
         if not line:
             continue
         print(f"[STM32] {line}")
-        if line in ("DONE", "ERROR", "BUSY"):
+        if line in ("DONE", "ERROR", "BUSY", "EMERGENCY_DONE"):
             return line
 
 
@@ -84,6 +84,8 @@ def main() -> None:
             if command == "x":
                 write_line_slow(ser, "X\n")
                 print("긴급 정지 X를 전송했습니다.")
+                result = wait_for_result(ser)
+                print(f"긴급 정지 결과: {result}")
                 continue
             if command:
                 print("Enter, q, x 중 하나를 입력하세요.")

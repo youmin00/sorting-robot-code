@@ -144,7 +144,12 @@ void Console_Print_Guide(void)
   Console_Write(" w : 일시정지 / 다시 누르면 재개\r\n");
   Console_Write(" e : 안전 기본 자세(0/90/90/90)로 이동\r\n");
   Console_Write(" r : 로딩 자세(90/120/56/0)로 이동\r\n");
-  Console_Write(" P,... : PC 카메라 프로그램의 동적 피킹 명령\r\n");
+  Console_Write(" x : 긴급정지 및 양쪽 공압 OFF\r\n");
+  Console_Write(" h : 작업 취소 후 안전 기본 자세로 복귀\r\n");
+  Console_Write(" P,... : 왼팔 단일 동적 피킹 명령\r\n");
+  Console_Write(" M,... : 양팔 동시 분류 명령\r\n");
+  Console_Write(" D,... : 교차 순차 파이프라인 명령\r\n");
+  Console_Write(" T,... : 오른팔 무공압 시험 명령\r\n");
   Console_Write(" 영문 소문자 한 글자를 입력하세요.\r\n");
   Console_Write("========================================\r\n");
 }
@@ -155,7 +160,7 @@ static void Handle_Key(uint8_t key)
 
   if ((key == 'q') || (key == 'Q'))
   {
-    Console_Write("[안내] 카메라 화면에서 p를 눌러 동적 좌표를 전송하세요.\r\n");
+    Console_Write("[안내] PC 통합 프로그램이 M/D 계획을 자동 전송합니다.\r\n");
   }
   else if ((key == 'x') || (key == 'X'))
   {
@@ -207,7 +212,7 @@ static void Handle_Key(uint8_t key)
   }
   else
   {
-    Console_Write("[안내] 사용할 수 없는 키입니다. q, w, e, r 중 하나를 입력하세요.\r\n");
+    Console_Write("[안내] 사용할 수 없는 키입니다. q, w, e, r, x, h 중 하나를 입력하세요.\r\n");
   }
 }
 
