@@ -8,8 +8,9 @@ Usage:
 Controls:
   q / ESC : quit
   s       : start conveyor automatic workflow
+  c       : clear statistics; start counting from the next work area
   x       : emergency stop
-  z       : reset camera/robot/conveyor workflow from the beginning
+  z       : reset camera/robot/conveyor workflow and statistics
   p       : move both robot arms to the loading pose (90/120/56/0)
 """
 
@@ -93,11 +94,11 @@ STM32_PORT = "COM4"
 STM32_BAUD = 115200
 AUTO_START_CONVEYOR = False
 
-CAMERA_SETTLE_SEC = 1.2
-CAMERA_SETTLE_FRAMES = 6
-CAMERA_INITIAL_EMPTY_GRACE_SEC = 1.25
-CAMERA_REACQUIRE_MAX_SEC = 0.8
-CAMERA_REACQUIRE_STABLE_FRAMES = 5
+CAMERA_SETTLE_SEC = 2.0
+CAMERA_SETTLE_FRAMES = 20
+CAMERA_INITIAL_EMPTY_GRACE_SEC = 2.0
+CAMERA_REACQUIRE_MAX_SEC = 1.5
+CAMERA_REACQUIRE_STABLE_FRAMES = 10
 CAMERA_STABLE_POSITION_TOLERANCE_MM = 2.0
 
 EMPTY_CONFIRM_FRAMES = 8
@@ -151,6 +152,21 @@ def scene_robot_xy_positions(
     positions: list[tuple[float, float]] = []
     for obj in objects:
         if obj.get("robot_x_mm") is None or obj.get("robot_y_mm") is None:
+            return None
+        positions.append((float(obj["robot_x_mm"]), float(obj["robot_y_mm"])))
+    return positions
+
+
+def scene_robot_ready_xy_positions(
+    objects: list[dict],
+) -> Optional[list[tuple[float, float]]]:
+    """Return XY only when every detected object has complete pick coordinates."""
+    positions: list[tuple[float, float]] = []
+    for obj in objects:
+        if any(
+            obj.get(key) is None
+            for key in ("robot_x_mm", "robot_y_mm", "robot_z_mm")
+        ):
             return None
         positions.append((float(obj["robot_x_mm"]), float(obj["robot_y_mm"])))
     return positions
@@ -231,11 +247,15 @@ def wait_arm_reply(
     conveyor_ser=None,
     allow_emergency_key: bool = True,
     camera_clear_callback=None,
+    statistics_reset_callback=None,
 ) -> Optional[str]:
     deadline = time.time() + timeout_sec
     emergency_requested = False
     while time.time() < deadline:
-        if allow_emergency_key and (cv2.waitKey(1) & 0xFF) == ord("x"):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("c") and statistics_reset_callback is not None:
+            statistics_reset_callback()
+        if allow_emergency_key and key == ord("x"):
             request_emergency_stop(arm_ser, conveyor_ser)
             emergency_requested = True
             allow_emergency_key = False
@@ -370,6 +390,8 @@ class D435Camera:
         self.sorting_statistics = SessionStatistics()
         self.statistics_panel_cache: Optional[np.ndarray] = None
         self.statistics_snapshot_cache: Optional[tuple] = None
+        self.statistics_waiting_for_next_area = False
+        self.statistics_reset_pending_for_next_area = False
         self.preserve_sort_slots = False
         self.reserved_sort_slot_ids: set[int] = set()
         self.last_contour_mode = ""
@@ -476,6 +498,9 @@ class D435Camera:
                 self._draw_runtime_mode_banner(display)
                 self._show_preview_and_statistics(display)
                 key = cv2.waitKey(1) & 0xFF
+                if key == ord("c"):
+                    self._queue_statistics_reset_for_next_area()
+                    continue
                 if key in (27, ord("q"), ord("x"), ord("z")):
                     raise RuntimeControlKey(key)
 
@@ -483,16 +508,9 @@ class D435Camera:
                 now = time.time()
                 if latest_objects or self.last_selected_candidates:
                     last_object_evidence_at = now
-                current = []
-                coordinates_valid = True
-                for obj in latest_objects:
-                    if obj.get("robot_x_mm") is None or obj.get("robot_y_mm") is None:
-                        coordinates_valid = False
-                        break
-                    current.append((
-                        float(obj["robot_x_mm"]),
-                        float(obj["robot_y_mm"]),
-                    ))
+                current_or_none = scene_robot_ready_xy_positions(latest_objects)
+                coordinates_valid = current_or_none is not None
+                current = [] if current_or_none is None else current_or_none
 
                 scene_stable = (
                     coordinates_valid
@@ -508,7 +526,13 @@ class D435Camera:
                     stable_count += 1
                 else:
                     if not coordinates_valid:
-                        last_instability_reason = "로봇 좌표 계산 미완료"
+                        if any(
+                            obj.get("robot_z_mm") is None
+                            for obj in latest_objects
+                        ):
+                            last_instability_reason = "로봇 Z 좌표 계산 미완료"
+                        else:
+                            last_instability_reason = "로봇 X/Y 좌표 계산 미완료"
                     elif stable_reference is None:
                         last_instability_reason = "첫 좌표 기준 수집"
                     elif len(stable_reference) != len(current):
@@ -544,11 +568,31 @@ class D435Camera:
                     return latest_objects
 
             log_warning(
-                "물체 중심좌표가 아직 흔들려 로봇 명령을 보류하고 다시 확인합니다. "
+                "물체 X/Y/Z 좌표가 아직 준비되지 않아 로봇 명령을 보류하고 다시 확인합니다. "
                 f"(원인: {last_instability_reason}, "
                 f"안정 {stable_count}/{max(1, int(required_stable_frames))}프레임, "
                 f"관찰 {observed_frames}프레임)"
             )
+            if bool(self.cfg.debug_detection):
+                print(
+                    f"[DBG] wait_objects={latest_objects!r} "
+                    f"support_depth={self.support_depth_m!r} "
+                    f"support_plane={self.support_plane_coeffs!r}"
+                )
+            if latest_objects and any(
+                obj.get("robot_z_mm") is None for obj in latest_objects
+            ):
+                # A candidate first acquired before the support-depth model is ready
+                # can become sticky with no usable height.  Release that early lock
+                # after one full observation window and reacquire from current depth.
+                # The conveyor remains stopped while this method is running.
+                log_warning(
+                    "초기 깊이 기준 없이 고정된 물체 추적을 해제하고 "
+                    "현재 깊이 영상으로 다시 인식합니다."
+                )
+                self._reset_tracking_state()
+                stable_reference = None
+                stable_count = 0
 
     @staticmethod
     def _warm_arm_plan_cache(objects: list[dict]) -> None:
@@ -611,11 +655,13 @@ class D435Camera:
         self._draw_runtime_mode_banner(display)
         self._show_preview_and_statistics(display)
         key = cv2.waitKey(1) & 0xFF
+        if key == ord("c"):
+            self._queue_statistics_reset_for_next_area()
         if key in (27, ord("q"), ord("x"), ord("z")):
             raise RuntimeControlKey(key)
 
         latest_objects = [dict(obj) for obj in self.last_tracked_objects]
-        current = scene_robot_xy_positions(latest_objects)
+        current = scene_robot_ready_xy_positions(latest_objects)
         if current is None or not scene_positions_stable(
             reference,
             current,
@@ -646,7 +692,35 @@ class D435Camera:
 
     def _show_preview_and_statistics(self, display: np.ndarray) -> None:
         """Refresh both OpenCV windows without adding another waitKey call."""
-        self.sorting_statistics.set_current_detected(len(self.last_tracked_objects))
+        detected_objects = (
+            []
+            if self.statistics_waiting_for_next_area
+            else self.last_tracked_objects
+        )
+        detected_sizes = {30: 0, 50: 0}
+        for obj in detected_objects:
+            size_mm = None
+            slot_index = int(obj.get("id", 0)) - 1
+            if 0 <= slot_index < len(self.slot_size_labels):
+                size_label = self.slot_size_labels[slot_index]
+                if size_label == "3cm":
+                    size_mm = 30
+                elif size_label == "5cm":
+                    size_mm = 50
+            if size_mm is None and obj.get("robot_z_mm") is not None:
+                size_mm = (
+                    30
+                    if abs(float(obj["robot_z_mm"]) - 30.0)
+                    <= abs(float(obj["robot_z_mm"]) - 50.0)
+                    else 50
+                )
+            if size_mm in detected_sizes:
+                detected_sizes[size_mm] += 1
+        self.sorting_statistics.set_current_detected(
+            len(detected_objects),
+            detected_sizes[30],
+            detected_sizes[50],
+        )
         snapshot = self.sorting_statistics.snapshot()
         if self.statistics_panel_cache is None or snapshot != self.statistics_snapshot_cache:
             self.statistics_panel_cache = render_statistics_panel(
@@ -656,6 +730,42 @@ class D435Camera:
             self.statistics_snapshot_cache = snapshot
             cv2.imshow("Sorting Statistics", self.statistics_panel_cache)
         cv2.imshow("D435 Preview", display)
+
+    def _reset_statistics_for_next_area(self, source_key: str) -> None:
+        self.sorting_statistics.reset(
+            last_result=f"{source_key.upper()} 초기화 · 다음 작업영역부터 집계"
+        )
+        self.statistics_reset_pending_for_next_area = False
+        self.statistics_waiting_for_next_area = True
+        self.statistics_panel_cache = None
+        self.statistics_snapshot_cache = None
+
+    def _start_statistics_for_next_area(self) -> bool:
+        if not self.statistics_waiting_for_next_area:
+            return False
+        self.statistics_waiting_for_next_area = False
+        self.sorting_statistics.last_result = "새 통계 집계 시작"
+        return True
+
+    def _queue_statistics_reset_for_next_area(self) -> None:
+        if self.statistics_reset_pending_for_next_area:
+            return
+        self.statistics_reset_pending_for_next_area = True
+        log_status(
+            "통계 초기화를 예약했습니다. 현재 작업영역은 기존 통계로 마무리하고 "
+            "다음 작업영역 도착 시 초기화합니다.",
+            PHASE_SYSTEM,
+        )
+
+    def _apply_statistics_reset_for_arriving_area(self) -> bool:
+        if not self.statistics_reset_pending_for_next_area:
+            return False
+        self.sorting_statistics.reset(last_result="예약된 통계 초기화 적용 · 새 집계 시작")
+        self.statistics_reset_pending_for_next_area = False
+        self.statistics_waiting_for_next_area = False
+        self.statistics_panel_cache = None
+        self.statistics_snapshot_cache = None
+        return True
 
     def _verify_camera_pick(
         self,
@@ -761,12 +871,24 @@ class D435Camera:
                     msg = ser.readline().decode(errors="ignore").strip()
 
                     if msg == "CHECK":
+                        if self._apply_statistics_reset_for_arriving_area():
+                            log_status(
+                                "예약된 통계 초기화를 적용했습니다. "
+                                "이번 작업영역부터 새로 집계합니다.",
+                                PHASE_DETECTING,
+                            )
+                        elif self._start_statistics_for_next_area():
+                            log_status(
+                                "새 통계 집계를 다음 작업영역부터 시작합니다.",
+                                PHASE_DETECTING,
+                            )
                         cycle_started_at = time.perf_counter()
                         cycle_success_started_at = self.sorting_statistics.successful
                         self.detection_overlay_enabled = True
                         log_status(
-                            f"검사 요청을 받았습니다. 좌표 안정 시 즉시 진행하며 "
-                            f"최대 {CAMERA_SETTLE_SEC:.1f}초 확인합니다.",
+                            f"검사 요청을 받았습니다. X/Y/Z 좌표를 "
+                            f"{CAMERA_SETTLE_FRAMES}프레임 연속 확인합니다. "
+                            f"(관찰 구간 {CAMERA_SETTLE_SEC:.1f}초 이상)",
                             PHASE_DETECTING,
                         )
                     elif msg:
@@ -936,6 +1058,9 @@ class D435Camera:
                                             if use_sequential else
                                             self._prefetch_scene_while_arms_place
                                         ),
+                                        statistics_reset_callback=(
+                                            self._queue_statistics_reset_for_next_area
+                                        ),
                                     )
                                     log_status(
                                         f"[시간] 로봇팔 계획 전송 {plan_send_elapsed:.3f}초, "
@@ -1015,6 +1140,9 @@ class D435Camera:
                                         ("PLACED", "ERROR", "BUSY"),
                                         conveyor_ser=ser,
                                         camera_clear_callback=self._prefetch_scene_while_pipeline_returns,
+                                        statistics_reset_callback=(
+                                            self._queue_statistics_reset_for_next_area
+                                        ),
                                     )
                                     log_status(
                                         f"[시간] 마지막 놓기 명령 전송 {plan_send_elapsed:.3f}초, "
@@ -1104,6 +1232,9 @@ class D435Camera:
                                     self._draw_runtime_mode_banner(display)
                                     self._show_preview_and_statistics(display)
                                     control_key = cv2.waitKey(1) & 0xFF
+                                    if control_key == ord("c"):
+                                        self._queue_statistics_reset_for_next_area()
+                                        continue
                                     if control_key in (27, ord("q"), ord("x"), ord("z")):
                                         raise RuntimeControlKey(control_key)
                                     current = [dict(obj) for obj in self.last_tracked_objects]
@@ -1208,8 +1339,22 @@ class D435Camera:
                     )
                 log_warning("긴급 정지가 완료되었습니다. 컨베이어는 정지 상태입니다.")
                 continue
+            if key == ord("c"):
+                if cycle_started_at is not None:
+                    self._queue_statistics_reset_for_next_area()
+                    continue
+                self._reset_statistics_for_next_area("c")
+                cycle_success_started_at = 0
+                log_status(
+                    "통계를 초기화했습니다. 현재 작업영역은 집계하지 않고 "
+                    "다음 작업영역부터 다시 계산합니다.",
+                    PHASE_SYSTEM,
+                )
+                continue
             if key == ord("z"):
-                self.sorting_statistics.cancel_pending()
+                self._reset_statistics_for_next_area("z")
+                cycle_started_at = None
+                cycle_success_started_at = 0
                 log_status("Z 리셋을 시작합니다. 전체 동작을 처음 상태로 되돌립니다.", PHASE_SYSTEM)
 
                 # 재시작 중 벨트가 움직이지 않도록 자동 모드를 먼저 정지
@@ -1966,12 +2111,14 @@ class D435Camera:
                     for idx, cand in enumerate(selected_candidates[:max_objects], start=1):
                         cxy = np.mean(cand["quad"].astype(np.float32), axis=0)
                         parts.append(
-                            "O{idx}:{src}@({x:.0f},{y:.0f}) z={z} lift={lift} nz={nz} span={span}".format(
+                            "O{idx}:{src}@({x:.0f},{y:.0f}) z={z} h={height} "
+                            "lift={lift} nz={nz} span={span}".format(
                                 idx=idx,
                                 src=cand.get("source", "na"),
                                 x=float(cxy[0]),
                                 y=float(cxy[1]),
                                 z=("na" if cand.get("depth_m") is None else f"{float(cand['depth_m']):.3f}"),
+                                height=("na" if cand.get("height_m") is None else f"{float(cand['height_m']):.3f}"),
                                 lift=("na" if cand.get("quad_depth_lift") is None else f"{float(cand['quad_depth_lift']):.3f}"),
                                 nz=("na" if cand.get("quad_abs_nz") is None else f"{float(cand['quad_abs_nz']):.2f}"),
                                 span=("na" if cand.get("quad_depth_span") is None else f"{float(cand['quad_depth_span']):.3f}"),
@@ -2251,11 +2398,28 @@ class D435Camera:
                 valid_depth = depth_m[valid]
                 depth_priority_contours = []
                 support_depth_est = self._estimate_support_depth_m(depth_m, valid)
-                support_depth = (
-                    float(support_depth_est)
-                    if support_depth_est is not None
-                    else float(np.percentile(valid_depth, np.clip(self.cfg.depth_top_support_percentile, 70.0, 98.0)))
-                )
+                if support_depth_est is not None:
+                    support_depth = float(support_depth_est)
+                else:
+                    # Detection already relies on this percentile when the stricter
+                    # connected-component support estimator cannot form a plane.
+                    # Keep the same fallback as the robot-coordinate reference too;
+                    # otherwise an object can be detected with valid X/Y and size
+                    # while robot Z remains unavailable indefinitely.
+                    support_depth = float(np.percentile(
+                        valid_depth,
+                        np.clip(self.cfg.depth_top_support_percentile, 70.0, 98.0),
+                    ))
+                    if np.isfinite(support_depth):
+                        if self.support_depth_m is None:
+                            self.support_depth_m = support_depth
+                        else:
+                            fallback_delta = abs(support_depth - float(self.support_depth_m))
+                            if fallback_delta <= 0.08:
+                                self.support_depth_m = (
+                                    0.92 * float(self.support_depth_m)
+                                    + 0.08 * support_depth
+                                )
                 if self.support_plane_coeffs is not None:
                     coeffs = self.support_plane_coeffs.astype(np.float32)
                     x_coords = np.arange(depth_m.shape[1], dtype=np.float32)[None, :]

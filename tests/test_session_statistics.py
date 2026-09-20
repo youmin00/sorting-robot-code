@@ -86,6 +86,8 @@ class SessionStatisticsTests(unittest.TestCase):
         self.assertEqual(1, stats.successful)
         self.assertEqual(1, stats.successful_by_size[30])
         self.assertEqual(1, stats.successful_by_arm["left"])
+        self.assertEqual(1, stats.successful_by_arm_and_size["left"][30])
+        self.assertEqual(0, stats.successful_by_arm_and_size["right"][30])
 
     def test_failed_retry_never_inflates_success(self):
         stats = SessionStatistics()
@@ -101,9 +103,27 @@ class SessionStatisticsTests(unittest.TestCase):
         self.assertEqual(2, stats.pickup_failures)
         self.assertEqual(1, stats.retries)
 
+    def test_reset_clears_all_counters_and_pending_state(self):
+        stats = SessionStatistics()
+        target = PickTarget(0.0, 55.0, 30, "left")
+        removed = VerificationSummary((TargetOutcome(target, REMOVED),))
+
+        stats.set_current_detected(2)
+        stats.begin_attempt([target], sequential=True)
+        stats.record_holding_pick(removed)
+        stats.record_motion_error()
+        stats.finish_cycle(3.5, 1)
+        stats.reset(last_result="C 초기화 · 다음 작업영역부터 집계")
+
+        snapshot = stats.snapshot()
+        self.assertTrue(all(value == 0 for value in snapshot[:-1]))
+        self.assertEqual("C 초기화 · 다음 작업영역부터 집계", snapshot[-1])
+        self.assertIsNone(stats.pending_holding)
+        self.assertEqual([], stats._problem_targets)
+
     def test_statistics_panel_is_valid_nonempty_image(self):
         panel = render_statistics_panel(SessionStatistics().snapshot(), font_path=None)
-        self.assertEqual((610, 500, 3), panel.shape)
+        self.assertEqual((480, 500, 3), panel.shape)
         self.assertEqual(np.uint8, panel.dtype)
         self.assertGreater(int(np.max(panel)), 38)
 

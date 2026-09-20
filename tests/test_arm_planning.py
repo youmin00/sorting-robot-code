@@ -132,8 +132,8 @@ class ArmInverseKinematicsTests(unittest.TestCase):
 
 
 class ArmSerialSafetyTests(unittest.TestCase):
-    def test_hardware_safe_byte_delay_uses_second_staged_setting(self):
-        self.assertEqual(0.012, program.ARM_SERIAL_BYTE_DELAY_SEC)
+    def test_hardware_safe_byte_delay_uses_verified_setting(self):
+        self.assertEqual(0.020, program.ARM_SERIAL_BYTE_DELAY_SEC)
 
     def test_dual_arm_command_is_unchanged(self):
         program._ARM_PLAN_CACHE.clear()
@@ -179,6 +179,22 @@ class ArmSerialSafetyTests(unittest.TestCase):
 
         stop.assert_called_once_with(arm_ser)
         self.assertEqual("EMERGENCY", result)
+
+    def test_integrated_arm_wait_queues_statistics_reset_without_interrupting(self):
+        arm_ser = Mock()
+        arm_ser.readline.side_effect = [b"", b"DONE\r\n"]
+        reset_callback = Mock()
+
+        with patch.object(program.cv2, "waitKey", side_effect=[ord("c"), -1]):
+            result = program.wait_arm_reply(
+                arm_ser,
+                ("DONE",),
+                timeout_sec=1.0,
+                statistics_reset_callback=reset_callback,
+            )
+
+        reset_callback.assert_called_once_with()
+        self.assertEqual("DONE", result)
 
     def test_right_arm_test_accepts_emergency_completion(self):
         arm_ser = Mock()

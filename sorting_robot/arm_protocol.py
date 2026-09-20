@@ -6,9 +6,9 @@ import time
 from typing import Optional
 
 
-# 15 ms는 실제 장비의 단일·교차 순차 작업에서 검증된 복귀 기준값이다.
-# 현재 값은 두 번째 단계 하드웨어 시험용이며, 오류가 있으면 0.015로 복원한다.
-ARM_SERIAL_BYTE_DELAY_SEC = 0.012
+# STM32 UART 수신부가 한 바이트씩 폴링하므로, 실제 장비에서 검증된
+# 안전 기준값인 20 ms를 유지한다. 작업 시간 단축보다 명령 무결성을 우선한다.
+ARM_SERIAL_BYTE_DELAY_SEC = 0.020
 
 
 def write_arm_line(arm_ser, line: str) -> None:

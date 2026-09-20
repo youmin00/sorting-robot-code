@@ -46,7 +46,7 @@ def write_line_slow(ser: serial.Serial, line: str) -> None:
     for byte in line.encode("ascii"):
         ser.write(bytes((byte,)))
         ser.flush()
-        time.sleep(0.015)
+        time.sleep(0.020)
 
 
 def make_right_test_command(plan: dict) -> str:

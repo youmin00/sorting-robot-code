@@ -254,7 +254,7 @@ def write_arm_line(arm_ser, line: str) -> None:
     for byte in line.encode("ascii"):
         arm_ser.write(bytes((byte,)))
         arm_ser.flush()
-        time.sleep(0.015)
+        time.sleep(0.020)
 
 
 def send_arm_plan(arm_ser, plan: dict) -> None:

@@ -205,6 +205,9 @@ def verify_pick_targets(
 @dataclass
 class SessionStatistics:
     current_detected: int = 0
+    current_detected_by_size: dict[int, int] = field(
+        default_factory=lambda: {30: 0, 50: 0}
+    )
     attempts: int = 0
     successful: int = 0
     pickup_failures: int = 0
@@ -217,6 +220,12 @@ class SessionStatistics:
     successful_by_arm: dict[str, int] = field(
         default_factory=lambda: {"left": 0, "right": 0}
     )
+    successful_by_arm_and_size: dict[str, dict[int, int]] = field(
+        default_factory=lambda: {
+            "left": {30: 0, 50: 0},
+            "right": {30: 0, 50: 0},
+        }
+    )
     simultaneous_commands: int = 0
     sequential_commands: int = 0
     completed_cycles: int = 0
@@ -226,8 +235,17 @@ class SessionStatistics:
     pending_holding: Optional[TargetOutcome] = None
     _problem_targets: list[PickTarget] = field(default_factory=list, repr=False)
 
-    def set_current_detected(self, count: int) -> None:
+    def set_current_detected(
+        self,
+        count: int,
+        size_30: int = 0,
+        size_50: int = 0,
+    ) -> None:
         self.current_detected = max(0, int(count))
+        self.current_detected_by_size = {
+            30: max(0, int(size_30)),
+            50: max(0, int(size_50)),
+        }
 
     @staticmethod
     def _same_logical_target(a: PickTarget, b: PickTarget) -> bool:
@@ -266,6 +284,11 @@ class SessionStatistics:
             self.successful_by_size.get(target.size_mm, 0) + 1
         )
         self.successful_by_arm[target.arm] = self.successful_by_arm.get(target.arm, 0) + 1
+        arm_sizes = self.successful_by_arm_and_size.setdefault(
+            target.arm,
+            {30: 0, 50: 0},
+        )
+        arm_sizes[target.size_mm] = arm_sizes.get(target.size_mm, 0) + 1
         self._clear_problem(target)
 
     def _record_non_success(self, outcome: TargetOutcome) -> None:
@@ -321,6 +344,31 @@ class SessionStatistics:
         self.pending_holding = None
         self.last_result = "대기 중"
 
+    def reset(self, *, last_result: str = "대기 중") -> None:
+        """Clear every session counter and any in-flight verification state."""
+        self.current_detected = 0
+        self.current_detected_by_size = {30: 0, 50: 0}
+        self.attempts = 0
+        self.successful = 0
+        self.pickup_failures = 0
+        self.uncertain = 0
+        self.retries = 0
+        self.motion_errors = 0
+        self.successful_by_size = {30: 0, 50: 0}
+        self.successful_by_arm = {"left": 0, "right": 0}
+        self.successful_by_arm_and_size = {
+            "left": {30: 0, 50: 0},
+            "right": {30: 0, 50: 0},
+        }
+        self.simultaneous_commands = 0
+        self.sequential_commands = 0
+        self.completed_cycles = 0
+        self.total_cycle_seconds = 0.0
+        self.last_result = str(last_result)
+        self.last_newly_visible = 0
+        self.pending_holding = None
+        self._problem_targets.clear()
+
     def snapshot(self) -> tuple:
         average = (
             self.total_cycle_seconds / self.completed_cycles
@@ -328,6 +376,8 @@ class SessionStatistics:
         )
         return (
             self.current_detected,
+            self.current_detected_by_size.get(30, 0),
+            self.current_detected_by_size.get(50, 0),
             self.attempts,
             self.successful,
             self.pickup_failures,
@@ -338,6 +388,10 @@ class SessionStatistics:
             self.successful_by_size.get(50, 0),
             self.successful_by_arm.get("left", 0),
             self.successful_by_arm.get("right", 0),
+            self.successful_by_arm_and_size.get("left", {}).get(30, 0),
+            self.successful_by_arm_and_size.get("left", {}).get(50, 0),
+            self.successful_by_arm_and_size.get("right", {}).get(30, 0),
+            self.successful_by_arm_and_size.get("right", {}).get(50, 0),
             self.simultaneous_commands,
             self.sequential_commands,
             1 if self.pending_holding is not None else 0,
@@ -353,11 +407,13 @@ def render_statistics_panel(
     font_path: Optional[str] = None,
     *,
     width: int = 500,
-    height: int = 610,
+    height: int = 480,
 ) -> np.ndarray:
     """Render the second OpenCV window; the caller caches unchanged snapshots."""
     (
         detected,
+        detected_30,
+        detected_50,
         attempts,
         successful,
         failures,
@@ -368,6 +424,10 @@ def render_statistics_panel(
         size_50,
         left_count,
         right_count,
+        left_30,
+        left_50,
+        right_30,
+        right_50,
         simultaneous,
         sequential,
         pending,
@@ -377,36 +437,85 @@ def render_statistics_panel(
         last_result,
     ) = snapshot
 
-    rows = [
-        ("현재 상태", str(last_result), (95, 220, 255)),
-        ("현재 카메라 감지", f"{detected}개", (110, 255, 150)),
-        ("확인 대기", f"{pending}개", (255, 210, 90)),
-        ("작업 시도", f"{attempts}회", (230, 230, 230)),
-        ("분류 완료 (카메라 확인)", f"{successful}개", (110, 255, 150)),
-        ("집기 실패", f"{failures}회", (255, 120, 120)),
-        ("확인 불가", f"{uncertain_count}회", (255, 190, 100)),
-        ("재시도", f"{retries}회", (220, 200, 130)),
-        ("로봇 응답 오류", f"{motion_errors}회", (255, 120, 120)),
-        ("3cm / 5cm 성공", f"{size_30} / {size_50}", (180, 220, 255)),
-        ("왼팔 / 오른팔 성공", f"{left_count} / {right_count}", (180, 220, 255)),
-        ("동시 / 순차 명령", f"{simultaneous} / {sequential}", (210, 210, 230)),
-        ("새로 보임·이동 의심", f"{newly_visible}개", (255, 190, 100)),
-        ("완료 작업구역", f"{completed_cycles}회", (210, 210, 230)),
-        ("평균 작업구역 시간", f"{average_seconds:.2f}초", (210, 210, 230)),
-    ]
-
     panel = np.full((height, width, 3), (28, 32, 38), dtype=np.uint8)
     if Image is not None and ImageDraw is not None and ImageFont is not None and font_path:
         try:
             title_font = ImageFont.truetype(font_path, 28)
-            label_font = ImageFont.truetype(font_path, 18)
-            value_font = ImageFont.truetype(font_path, 19)
+            small_font = ImageFont.truetype(font_path, 14)
+            label_font = ImageFont.truetype(font_path, 16)
+            value_font = ImageFont.truetype(font_path, 17)
+            metric_font = ImageFont.truetype(font_path, 25)
+            arm_title_font = ImageFont.truetype(font_path, 20)
+            arm_total_font = ImageFont.truetype(font_path, 28)
             pil = Image.fromarray(cv2.cvtColor(panel, cv2.COLOR_BGR2RGB))
             draw = ImageDraw.Draw(pil)
             draw.text((24, 18), "분류 통계", font=title_font, fill=(245, 245, 245))
             draw.line((24, 58, width - 24, 58), fill=(85, 95, 108), width=2)
-            y = 76
-            for label, value, bgr in rows:
+
+            summary = (
+                ("전체 감지", detected, (110, 255, 150)),
+                ("3cm 감지", detected_30, (110, 210, 255)),
+                ("5cm 감지", detected_50, (255, 185, 115)),
+            )
+            content_x = 24
+            gap = 8
+            card_w = (width - 48 - gap * 2) // 3
+            for index, (label, value, bgr) in enumerate(summary):
+                x0 = content_x + index * (card_w + gap)
+                x1 = x0 + card_w
+                draw.rounded_rectangle(
+                    (x0, 75, x1, 150),
+                    radius=9,
+                    fill=(35, 41, 49),
+                    outline=(65, 75, 88),
+                    width=1,
+                )
+                draw.text(((x0 + x1) // 2, 85), label, font=small_font,
+                          fill=(170, 180, 193), anchor="ma")
+                rgb = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+                draw.text(((x0 + x1) // 2, 113), f"{value}개", font=metric_font,
+                          fill=rgb, anchor="ma")
+
+            arm_gap = 14
+            arm_w = (width - 48 - arm_gap) // 2
+            arm_cards = (
+                (24, "왼쪽 팔", left_count, left_30, left_50, (110, 210, 255)),
+                (24 + arm_w + arm_gap, "오른쪽 팔", right_count, right_30, right_50,
+                 (255, 185, 115)),
+            )
+            for x0, title, total, count_30, count_50, accent in arm_cards:
+                x1 = x0 + arm_w
+                draw.rounded_rectangle(
+                    (x0, 167, x1, 324),
+                    radius=12,
+                    fill=(34, 40, 48),
+                    outline=accent,
+                    width=2,
+                )
+                draw.text((x0 + 16, 181), title, font=arm_title_font, fill=accent)
+                draw.text((x0 + 16, 217), "성공", font=small_font,
+                          fill=(170, 180, 193))
+                draw.text((x1 - 16, 208), f"{total}개", font=arm_total_font,
+                          fill=(235, 242, 248), anchor="ra")
+                draw.line((x0 + 16, 258, x1 - 16, 258), fill=(64, 73, 85), width=1)
+                draw.text((x0 + 16, 274), "3cm", font=label_font,
+                          fill=(185, 195, 208))
+                draw.text((x1 - 16, 274), f"{count_30}개", font=value_font,
+                          fill=(215, 230, 245), anchor="ra")
+                draw.text((x0 + 16, 299), "5cm", font=label_font,
+                          fill=(185, 195, 208))
+                draw.text((x1 - 16, 299), f"{count_50}개", font=value_font,
+                          fill=(215, 230, 245), anchor="ra")
+
+            common_rows = (
+                ("전체 3cm / 5cm", f"{size_30} / {size_50}", (180, 220, 255)),
+                ("재시도", f"{retries}회", (255, 190, 110)),
+                ("동시 / 순차 명령", f"{simultaneous} / {sequential}", (215, 215, 235)),
+                ("완료 구역 / 평균 시간", f"{completed_cycles} / {average_seconds:.2f}초",
+                 (215, 215, 235)),
+            )
+            y = 343
+            for label, value, bgr in common_rows:
                 rgb = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
                 draw.text((24, y), label, font=label_font, fill=(175, 185, 198))
                 draw.text((width - 24, y), value, font=value_font, fill=rgb, anchor="ra")
@@ -417,15 +526,30 @@ def render_statistics_panel(
 
     cv2.putText(panel, "SORTING STATISTICS", (22, 42), cv2.FONT_HERSHEY_SIMPLEX,
                 0.75, (240, 240, 240), 2, cv2.LINE_AA)
+    cv2.putText(panel, f"Detected {detected}  3cm {detected_30}  5cm {detected_50}",
+                (22, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (205, 215, 225), 1, cv2.LINE_AA)
+    cv2.rectangle(panel, (22, 104), (242, 262), (90, 180, 240), 2)
+    cv2.rectangle(panel, (258, 104), (478, 262), (240, 170, 90), 2)
+    fallback_arms = (
+        (38, "LEFT ARM", left_count, left_30, left_50),
+        (274, "RIGHT ARM", right_count, right_30, right_50),
+    )
+    for x, title, total, count_30, count_50 in fallback_arms:
+        cv2.putText(panel, title, (x, 137), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62, (235, 235, 240), 2, cv2.LINE_AA)
+        cv2.putText(panel, f"Success: {total}", (x, 177), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (160, 245, 185), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"3cm: {count_30}", (x, 212), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, (205, 215, 225), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"5cm: {count_50}", (x, 242), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, (205, 215, 225), 1, cv2.LINE_AA)
     fallback_rows = (
-        f"Detected now: {detected}", f"Pending: {pending}",
-        f"Attempts: {attempts}", f"Camera-confirmed: {successful}",
-        f"Pick failures: {failures}", f"Uncertain: {uncertain_count}",
-        f"Retries: {retries}", f"3cm / 5cm: {size_30} / {size_50}",
-        f"Left / Right: {left_count} / {right_count}",
-        f"Average cycle: {average_seconds:.2f}s",
+        f"Total success: {successful}  (3cm {size_30} / 5cm {size_50})",
+        f"Retries: {retries}",
+        f"Simultaneous / sequential: {simultaneous} / {sequential}",
+        f"Cycles / average: {completed_cycles} / {average_seconds:.2f}s",
     )
     for index, text in enumerate(fallback_rows):
-        cv2.putText(panel, text, (22, 82 + index * 38), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.58, (205, 215, 225), 1, cv2.LINE_AA)
+        cv2.putText(panel, text, (22, 304 + index * 40), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.54, (205, 215, 225), 1, cv2.LINE_AA)
     return panel
