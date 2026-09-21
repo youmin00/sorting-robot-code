@@ -31,6 +31,32 @@ program = load_program()
 
 
 class SyntheticDetectionRegressionTests(unittest.TestCase):
+    def test_scene_consensus_uses_nonconsecutive_real_sightings(self):
+        groups = []
+        scenes = [
+            [{"id": 1, "robot_x_mm": 10.0, "robot_y_mm": 40.0, "robot_z_mm": 30.0}],
+            [],
+            [{"id": 1, "robot_x_mm": 12.0, "robot_y_mm": 39.0, "robot_z_mm": 30.0}],
+            [],
+            [{"id": 1, "robot_x_mm": 11.0, "robot_y_mm": 41.0, "robot_z_mm": 30.0}],
+        ]
+        for scene in scenes:
+            program.record_scene_consensus_observation(groups, scene)
+
+        result = program.select_scene_consensus(groups, min_sightings=3)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(11.0, result[0]["robot_x_mm"])
+        self.assertEqual(40.0, result[0]["robot_y_mm"])
+
+    def test_scene_consensus_ignores_incomplete_coordinates(self):
+        groups = []
+        program.record_scene_consensus_observation(
+            groups,
+            [{"robot_x_mm": 10.0, "robot_y_mm": 40.0, "robot_z_mm": None}],
+        )
+        self.assertEqual([], groups)
+
     def test_pipeline_prefetch_positions_require_complete_and_stable_xy(self):
         positions = program.scene_robot_xy_positions
         stable = program.scene_positions_stable
@@ -113,7 +139,10 @@ class SyntheticDetectionRegressionTests(unittest.TestCase):
                 self.last_selected_candidates = []
 
         camera = FakeCamera()
-        with patch.object(program.cv2, "waitKey", return_value=-1):
+        with (
+            patch.object(program.cv2, "waitKey", return_value=-1),
+            patch.object(program, "CAMERA_CONSENSUS_MIN_OBSERVATION_SEC", 0.0),
+        ):
             result = program.D435Camera._wait_for_stable_scene(
                 camera,
                 max_wait_sec=0.001,
@@ -122,6 +151,60 @@ class SyntheticDetectionRegressionTests(unittest.TestCase):
 
         self.assertGreaterEqual(camera.frame_count, 4)
         self.assertEqual(50.0, result[0]["robot_z_mm"])
+
+    def test_stable_scene_returns_consensus_across_detection_dropouts(self):
+        def complete(x_mm):
+            return {
+                "id": 1,
+                "x": 320,
+                "y": 240,
+                "z": 0.40,
+                "robot_x_mm": float(x_mm),
+                "robot_y_mm": 40.0,
+                "robot_z_mm": 30.0,
+            }
+
+        class FakeCamera:
+            def __init__(self):
+                self.scenes = [[complete(10.0)], [], [complete(12.0)], [], [complete(11.0)]]
+                self.frame_count = 0
+                self.last_tracked_objects = []
+                self.last_selected_candidates = []
+
+            def get_frames(self):
+                return None, None
+
+            def _compose_display(self, _color, _depth):
+                index = min(self.frame_count, len(self.scenes) - 1)
+                self.last_tracked_objects = self.scenes[index]
+                self.frame_count += 1
+                return np.zeros((1, 1, 3), dtype=np.uint8)
+
+            def _draw_runtime_mode_banner(self, _display):
+                return None
+
+            def _show_preview_and_statistics(self, _display):
+                return None
+
+            def _reset_tracking_state(self):
+                self.last_tracked_objects = []
+                self.last_selected_candidates = []
+
+        camera = FakeCamera()
+        with (
+            patch.object(program.cv2, "waitKey", return_value=-1),
+            patch.object(program, "CAMERA_CONSENSUS_MIN_SIGHTINGS", 3),
+            patch.object(program, "CAMERA_CONSENSUS_MIN_OBSERVATION_SEC", 0.0),
+        ):
+            result = program.D435Camera._wait_for_stable_scene(
+                camera,
+                max_wait_sec=30.0,
+                required_stable_frames=20,
+            )
+
+        self.assertEqual(5, camera.frame_count)
+        self.assertEqual(11.0, result[0]["robot_x_mm"])
+        self.assertEqual(result, camera.last_tracked_objects)
 
     def test_empty_scene_waits_after_brief_object_evidence(self):
         ready = program.empty_scene_ready_after_grace

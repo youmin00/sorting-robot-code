@@ -102,6 +102,21 @@ class SessionStatisticsTests(unittest.TestCase):
         self.assertEqual(0, stats.successful)
         self.assertEqual(2, stats.pickup_failures)
         self.assertEqual(1, stats.retries)
+        self.assertEqual(2, stats.single_commands)
+        self.assertEqual(0, stats.simultaneous_commands)
+
+    def test_command_modes_distinguish_single_simultaneous_and_sequential(self):
+        stats = SessionStatistics()
+        left = PickTarget(0.0, 55.0, 30, "left")
+        right = PickTarget(0.0, -55.0, 50, "right")
+
+        stats.begin_attempt([left], sequential=False)
+        stats.begin_attempt([left, right], sequential=False)
+        stats.begin_attempt([right], sequential=True)
+
+        self.assertEqual(1, stats.single_commands)
+        self.assertEqual(1, stats.simultaneous_commands)
+        self.assertEqual(1, stats.sequential_commands)
 
     def test_reset_clears_all_counters_and_pending_state(self):
         stats = SessionStatistics()

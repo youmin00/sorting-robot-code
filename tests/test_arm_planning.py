@@ -18,6 +18,8 @@ RIGHT_ARM_TEST_PATH = PROJECT_ROOT / "오른팔_동작_시험.py"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from sorting_robot import arm_planning
+
 
 def load_program(path=PROGRAM_PATH, module_name="integrated_sorting"):
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -105,6 +107,83 @@ def scalar_reference_ik(
 
 
 class ArmInverseKinematicsTests(unittest.TestCase):
+    def test_left_arm_center_calibration_moves_target_3_mm_farther(self):
+        self.assertTrue(
+            math.isclose(
+                arm_planning.ROBOT_FORWARD_TO_CENTER_MM, 209.5, abs_tol=1e-12
+            )
+        )
+        self.assertTrue(
+            math.isclose(
+                arm_planning.LEFT_ARM_CENTER_PICK_OFFSET_MM, 3.0, abs_tol=1e-12
+            )
+        )
+        self.assertTrue(
+            math.isclose(
+                arm_planning.LEFT_ARM_APPROACH_HEIGHT_OFFSET_MM,
+                3.0,
+                abs_tol=1e-12,
+            )
+        )
+        self.assertTrue(
+            math.isclose(
+                arm_planning.ROBOT_FORWARD_TO_CENTER_MM
+                + arm_planning.LEFT_ARM_CENTER_PICK_OFFSET_MM,
+                212.5,
+                abs_tol=1e-12,
+            )
+        )
+        self.assertTrue(
+            math.isclose(
+                camera_test.LEFT_ARM_CENTER_PICK_OFFSET_MM,
+                arm_planning.LEFT_ARM_CENTER_PICK_OFFSET_MM,
+                abs_tol=1e-12,
+            )
+        )
+        self.assertTrue(
+            math.isclose(
+                camera_test.RIGHT_ARM_FORWARD_TO_CENTER_MM,
+                camera_test.ROBOT_FORWARD_TO_CENTER_MM,
+                abs_tol=1e-12,
+            )
+        )
+
+    def test_pick_plan_applies_center_offset_only_to_left_arm(self):
+        def reachable_pose(*_args):
+            return {
+                "j1": 90.0,
+                "j2": 90.0,
+                "j3": 45.0,
+                "j4": 15.0,
+                "tilt": 0.0,
+                "error": 0.0,
+            }
+
+        arm_planning._ARM_PLAN_CACHE.clear()
+        with patch.object(
+            arm_planning, "_arm_ik", side_effect=reachable_pose
+        ) as mocked_ik:
+            arm_planning.build_arm_pick_plan(
+                {"robot_x_mm": 0.0, "robot_y_mm": 50.0, "robot_z_mm": 30.0},
+                "left",
+            )
+            self.assertEqual(
+                {212.5}, {call.args[5] for call in mocked_ik.call_args_list}
+            )
+            self.assertEqual(49.0, mocked_ik.call_args_list[0].args[2])
+            self.assertEqual(46.0, mocked_ik.call_args_list[-1].args[2])
+
+            mocked_ik.reset_mock()
+            arm_planning.build_arm_pick_plan(
+                {"robot_x_mm": 0.0, "robot_y_mm": -50.0, "robot_z_mm": 30.0},
+                "right",
+            )
+            self.assertEqual(
+                {arm_planning.RIGHT_ARM_FORWARD_TO_CENTER_MM},
+                {call.args[5] for call in mocked_ik.call_args_list},
+            )
+            self.assertEqual(46.0, mocked_ik.call_args_list[0].args[2])
+
     def test_vectorized_search_matches_original_search(self):
         cases = (
             (0.0, 50.0, 46.0, 0.0, 15.0, 209.5),
@@ -135,7 +214,7 @@ class ArmSerialSafetyTests(unittest.TestCase):
     def test_hardware_safe_byte_delay_uses_verified_setting(self):
         self.assertEqual(0.020, program.ARM_SERIAL_BYTE_DELAY_SEC)
 
-    def test_dual_arm_command_is_unchanged(self):
+    def test_dual_arm_command_uses_calibrated_plans(self):
         program._ARM_PLAN_CACHE.clear()
         left = program.build_arm_pick_plan(
             {"robot_x_mm": 0.0, "robot_y_mm": 50.0, "robot_z_mm": 30.0},
@@ -146,7 +225,7 @@ class ArmSerialSafetyTests(unittest.TestCase):
             "right",
         )
         self.assertEqual(
-            "M,1,30,94,72,36,28.5,68.5,39,35,68,39.5,34.5,70.5,38,27.5,"
+            "M,1,30,93.5,71,33.5,27,67.5,37.5,34.5,67,38,34,69,36,27,"
             "1,30,90,73.5,38,29,70,41.5,36,70,42,35,72,40,28\n",
             program._build_dual_arm_line(left, right, sequential=False),
         )

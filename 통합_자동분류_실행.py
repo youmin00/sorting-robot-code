@@ -100,6 +100,10 @@ CAMERA_INITIAL_EMPTY_GRACE_SEC = 2.0
 CAMERA_REACQUIRE_MAX_SEC = 1.5
 CAMERA_REACQUIRE_STABLE_FRAMES = 10
 CAMERA_STABLE_POSITION_TOLERANCE_MM = 2.0
+CAMERA_CONSENSUS_POSITION_TOLERANCE_MM = 5.0
+CAMERA_CONSENSUS_MIN_SIGHTINGS = 5
+CAMERA_CONSENSUS_MIN_OBSERVATION_SEC = 3.75
+CAMERA_CONSENSUS_MAX_WAIT_SEC = 7.5
 
 EMPTY_CONFIRM_FRAMES = 8
 OBJECT_SLOT_MATCH_PX = 65
@@ -170,6 +174,102 @@ def scene_robot_ready_xy_positions(
             return None
         positions.append((float(obj["robot_x_mm"]), float(obj["robot_y_mm"])))
     return positions
+
+
+def _scene_position_match_indices(
+    reference: list[tuple[float, float]],
+    current: list[tuple[float, float]],
+    tolerance_mm: float,
+) -> Optional[list[int]]:
+    """Return current indices aligned to reference positions, or None."""
+    if len(reference) != len(current):
+        return None
+    unmatched = list(range(len(current)))
+    aligned: list[int] = []
+    tolerance = max(0.0, float(tolerance_mm))
+    for reference_x, reference_y in reference:
+        if not unmatched:
+            return None
+        distances = [
+            float(np.hypot(
+                current[index][0] - reference_x,
+                current[index][1] - reference_y,
+            ))
+            for index in unmatched
+        ]
+        nearest_offset = int(np.argmin(np.asarray(distances, dtype=np.float64)))
+        if distances[nearest_offset] > tolerance:
+            return None
+        aligned.append(unmatched.pop(nearest_offset))
+    return aligned
+
+
+def _consensus_scene_from_group(group: dict) -> list[dict]:
+    result: list[dict] = []
+    for slot_index, samples in enumerate(group["samples_by_slot"]):
+        merged = dict(samples[-1])
+        for field in ("robot_x_mm", "robot_y_mm", "robot_z_mm", "z"):
+            values = [float(sample[field]) for sample in samples if sample.get(field) is not None]
+            if values:
+                merged[field] = float(np.median(np.asarray(values, dtype=np.float64)))
+        for field in ("x", "y"):
+            values = [float(sample[field]) for sample in samples if sample.get(field) is not None]
+            if values:
+                merged[field] = int(round(float(np.median(np.asarray(values, dtype=np.float64)))))
+        merged["id"] = slot_index + 1
+        result.append(merged)
+    return result
+
+
+def record_scene_consensus_observation(
+    groups: list[dict],
+    objects: list[dict],
+    tolerance_mm: float = CAMERA_CONSENSUS_POSITION_TOLERANCE_MM,
+) -> None:
+    """Accumulate only complete, actually observed scenes for later consensus."""
+    positions = scene_robot_ready_xy_positions(objects)
+    if not positions:
+        return
+
+    for group in groups:
+        aligned = _scene_position_match_indices(
+            group["reference"], positions, tolerance_mm
+        )
+        if aligned is None:
+            continue
+        for slot_index, object_index in enumerate(aligned):
+            group["samples_by_slot"][slot_index].append(dict(objects[object_index]))
+        group["hits"] += 1
+        consensus = _consensus_scene_from_group(group)
+        group["reference"] = scene_robot_ready_xy_positions(consensus)
+        return
+
+    groups.append({
+        "hits": 1,
+        "reference": list(positions),
+        "samples_by_slot": [[dict(obj)] for obj in objects],
+    })
+
+
+def select_scene_consensus(
+    groups: list[dict],
+    min_sightings: int,
+    prefer_more_objects: bool = True,
+) -> Optional[list[dict]]:
+    eligible = [group for group in groups if group["hits"] >= max(1, min_sightings)]
+    if not eligible:
+        return None
+    if prefer_more_objects:
+        chosen = max(
+            eligible,
+            key=lambda group: (len(group["samples_by_slot"]), group["hits"]),
+        )
+    else:
+        chosen = max(
+            eligible,
+            key=lambda group: (group["hits"], len(group["samples_by_slot"])),
+        )
+    return _consensus_scene_from_group(chosen)
 
 
 def empty_scene_ready_after_grace(
@@ -470,6 +570,11 @@ class D435Camera:
         stable_reference = None
         stable_count = 0
         latest_objects: list[dict] = []
+        consensus_groups: list[dict] = []
+        consensus_deadline = wait_started_at + max(
+            CAMERA_CONSENSUS_MAX_WAIT_SEC,
+            float(max_wait_sec),
+        )
         observed_frames = 0
         last_instability_reason = "안정 프레임 수 부족"
 
@@ -511,6 +616,23 @@ class D435Camera:
                 current_or_none = scene_robot_ready_xy_positions(latest_objects)
                 coordinates_valid = current_or_none is not None
                 current = [] if current_or_none is None else current_or_none
+
+                record_scene_consensus_observation(
+                    consensus_groups,
+                    latest_objects,
+                    CAMERA_CONSENSUS_POSITION_TOLERANCE_MM,
+                )
+                consensus_scene = select_scene_consensus(
+                    consensus_groups,
+                    CAMERA_CONSENSUS_MIN_SIGHTINGS,
+                )
+                minimum_observation_complete = (
+                    now - wait_started_at
+                    >= CAMERA_CONSENSUS_MIN_OBSERVATION_SEC
+                )
+                if consensus_scene is not None and minimum_observation_complete:
+                    self.last_tracked_objects = [dict(obj) for obj in consensus_scene]
+                    return [dict(obj) for obj in consensus_scene]
 
                 scene_stable = (
                     coordinates_valid
@@ -564,8 +686,25 @@ class D435Camera:
                 if (
                     stable_count >= max(1, int(required_stable_frames))
                     and empty_grace_complete
+                    and minimum_observation_complete
                 ):
                     return latest_objects
+
+                if now >= consensus_deadline:
+                    fallback_scene = select_scene_consensus(
+                        consensus_groups,
+                        min_sightings=1,
+                        prefer_more_objects=False,
+                    )
+                    if fallback_scene is not None:
+                        log_warning(
+                            "연속 좌표 안정화 대신 관찰 구간에서 가장 많이 반복된 "
+                            "실제 포착 좌표의 중앙값으로 작업을 진행합니다."
+                        )
+                        self.last_tracked_objects = [
+                            dict(obj) for obj in fallback_scene
+                        ]
+                        return [dict(obj) for obj in fallback_scene]
 
             log_warning(
                 "물체 X/Y/Z 좌표가 아직 준비되지 않아 로봇 명령을 보류하고 다시 확인합니다. "
@@ -887,7 +1026,9 @@ class D435Camera:
                         self.detection_overlay_enabled = True
                         log_status(
                             f"검사 요청을 받았습니다. X/Y/Z 좌표를 "
-                            f"{CAMERA_SETTLE_FRAMES}프레임 연속 확인합니다. "
+                            f"연속 {CAMERA_SETTLE_FRAMES}프레임 또는 같은 위치 "
+                            f"{CAMERA_CONSENSUS_MIN_SIGHTINGS}회 포착으로 "
+                            f"최소 {CAMERA_CONSENSUS_MIN_OBSERVATION_SEC:.1f}초 확인합니다. "
                             f"(관찰 구간 {CAMERA_SETTLE_SEC:.1f}초 이상)",
                             PHASE_DETECTING,
                         )

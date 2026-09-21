@@ -226,6 +226,7 @@ class SessionStatistics:
             "right": {30: 0, 50: 0},
         }
     )
+    single_commands: int = 0
     simultaneous_commands: int = 0
     sequential_commands: int = 0
     completed_cycles: int = 0
@@ -264,6 +265,8 @@ class SessionStatistics:
         if target_list:
             if sequential:
                 self.sequential_commands += 1
+            elif len(target_list) == 1:
+                self.single_commands += 1
             else:
                 self.simultaneous_commands += 1
         self.last_result = f"집기 명령 전송 ({len(target_list)}개)"
@@ -360,6 +363,7 @@ class SessionStatistics:
             "left": {30: 0, 50: 0},
             "right": {30: 0, 50: 0},
         }
+        self.single_commands = 0
         self.simultaneous_commands = 0
         self.sequential_commands = 0
         self.completed_cycles = 0
@@ -392,6 +396,7 @@ class SessionStatistics:
             self.successful_by_arm_and_size.get("left", {}).get(50, 0),
             self.successful_by_arm_and_size.get("right", {}).get(30, 0),
             self.successful_by_arm_and_size.get("right", {}).get(50, 0),
+            self.single_commands,
             self.simultaneous_commands,
             self.sequential_commands,
             1 if self.pending_holding is not None else 0,
@@ -428,6 +433,7 @@ def render_statistics_panel(
         left_50,
         right_30,
         right_50,
+        single,
         simultaneous,
         sequential,
         pending,
@@ -510,7 +516,8 @@ def render_statistics_panel(
             common_rows = (
                 ("전체 3cm / 5cm", f"{size_30} / {size_50}", (180, 220, 255)),
                 ("재시도", f"{retries}회", (255, 190, 110)),
-                ("동시 / 순차 명령", f"{simultaneous} / {sequential}", (215, 215, 235)),
+                ("단일 / 동시 / 순차", f"{single} / {simultaneous} / {sequential}",
+                 (215, 215, 235)),
                 ("완료 구역 / 평균 시간", f"{completed_cycles} / {average_seconds:.2f}초",
                  (215, 215, 235)),
             )
@@ -546,7 +553,7 @@ def render_statistics_panel(
     fallback_rows = (
         f"Total success: {successful}  (3cm {size_30} / 5cm {size_50})",
         f"Retries: {retries}",
-        f"Simultaneous / sequential: {simultaneous} / {sequential}",
+        f"Single / simultaneous / sequential: {single} / {simultaneous} / {sequential}",
         f"Cycles / average: {completed_cycles} / {average_seconds:.2f}s",
     )
     for index, text in enumerate(fallback_rows):

@@ -11,6 +11,10 @@ ARM_PLAN_CACHE_GRID_MM = 2.0
 ARM_PLAN_CACHE_MAX_ENTRIES = 256
 
 ROBOT_FORWARD_TO_CENTER_MM = 209.5
+# Aim only the left arm 3.0 mm farther from the arm, toward belt center.
+LEFT_ARM_CENTER_PICK_OFFSET_MM = 3.0
+# Keep the left arm clear of the cube until the vertical pickup descent.
+LEFT_ARM_APPROACH_HEIGHT_OFFSET_MM = 3.0
 RIGHT_ARM_FORWARD_TO_CENTER_MM = 205.5
 ROBOT_TOOL_LEFT_OFFSET_MM = 12.0
 ROBOT_L1_MM = 130.0
@@ -185,7 +189,7 @@ def build_arm_pick_plan(obj: dict, arm: str = "left") -> dict:
     forward_to_center_mm = (
         RIGHT_ARM_FORWARD_TO_CENTER_MM
         if arm == "right"
-        else ROBOT_FORWARD_TO_CENTER_MM
+        else ROBOT_FORWARD_TO_CENTER_MM + LEFT_ARM_CENTER_PICK_OFFSET_MM
     )
     edge_extra_drop = (
         EDGE_3CM_EXTRA_DROP_MM
@@ -195,8 +199,11 @@ def build_arm_pick_plan(obj: dict, arm: str = "left") -> dict:
         else 0.0
     )
     contact_z = top - edge_extra_drop
+    approach_z = top + 16.0
+    if arm != "right":
+        approach_z += LEFT_ARM_APPROACH_HEIGHT_OFFSET_MM
     approach = _arm_ik(
-        camera_x, camera_y, top + 16.0, 0.0, 15.0, forward_to_center_mm
+        camera_x, camera_y, approach_z, 0.0, 15.0, forward_to_center_mm
     )
     contact = _arm_ik(
         camera_x, camera_y, contact_z, 0.0, 15.0, forward_to_center_mm
@@ -322,4 +329,3 @@ def choose_pipeline_plans(
     if right_plans:
         return None, right_plans[0]
     return None, None
-

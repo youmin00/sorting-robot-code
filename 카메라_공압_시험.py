@@ -68,6 +68,11 @@ ROBOT_TALL_OBJECT_Y_GAIN = 1.06
 ROBOT_ARM_PORT = "COM3"
 ROBOT_ARM_BAUD = 115200
 ROBOT_FORWARD_TO_CENTER_MM = 209.5
+# Aim only the left arm 3.0 mm farther from the arm, toward belt center.
+LEFT_ARM_CENTER_PICK_OFFSET_MM = 3.0
+# Keep the left arm clear of the cube until the vertical pickup descent.
+LEFT_ARM_APPROACH_HEIGHT_OFFSET_MM = 3.0
+RIGHT_ARM_FORWARD_TO_CENTER_MM = 209.5
 ROBOT_TOOL_LEFT_OFFSET_MM = 12.0
 ROBOT_L1_MM = 130.0
 ROBOT_L2_MM = 130.0
@@ -84,9 +89,10 @@ EDGE_3CM_EXTRA_DROP_MM = 4.0
 
 
 def _arm_ik(camera_x_mm: float, camera_y_mm: float, target_z_mm: float,
-            compression_mm: float, max_tilt_deg: float) -> Optional[dict]:
+            compression_mm: float, max_tilt_deg: float,
+            forward_to_center_mm: float = ROBOT_FORWARD_TO_CENTER_MM) -> Optional[dict]:
     """Same 0.5-degree IK used by the verified single-cube simulator."""
-    robot_x = ROBOT_FORWARD_TO_CENTER_MM - float(camera_y_mm)
+    robot_x = float(forward_to_center_mm) - float(camera_y_mm)
     robot_y = float(camera_x_mm)
     target_radius = float(np.hypot(robot_x, robot_y))
     if target_radius < ROBOT_TOOL_LEFT_OFFSET_MM:
@@ -189,6 +195,11 @@ def build_arm_pick_plan(obj: dict, arm: str = "left") -> dict:
             raise ValueError("큐브 전체가 왼쪽 로봇 작업영역 안에 있지 않습니다.")
         camera_x = global_camera_x
         camera_y = global_camera_y
+    forward_to_center_mm = (
+        RIGHT_ARM_FORWARD_TO_CENTER_MM
+        if arm == "right"
+        else ROBOT_FORWARD_TO_CENTER_MM + LEFT_ARM_CENTER_PICK_OFFSET_MM
+    )
     top = float(cube_size)
     edge_extra_drop = (
         EDGE_3CM_EXTRA_DROP_MM
@@ -198,10 +209,20 @@ def build_arm_pick_plan(obj: dict, arm: str = "left") -> dict:
         else 0.0
     )
     contact_z = top - edge_extra_drop
-    approach = _arm_ik(camera_x, camera_y, top + 16.0, 0.0, 15.0)
-    contact = _arm_ik(camera_x, camera_y, contact_z, 0.0, 15.0)
+    approach_z = top + 16.0
+    if arm != "right":
+        approach_z += LEFT_ARM_APPROACH_HEIGHT_OFFSET_MM
+    approach = _arm_ik(
+        camera_x, camera_y, approach_z, 0.0, 15.0, forward_to_center_mm
+    )
+    contact = _arm_ik(
+        camera_x, camera_y, contact_z, 0.0, 15.0, forward_to_center_mm
+    )
     preload_compression = 2.0
-    preload = _arm_ik(camera_x, camera_y, contact_z, preload_compression, 15.0)
+    preload = _arm_ik(
+        camera_x, camera_y, contact_z, preload_compression, 15.0,
+        forward_to_center_mm
+    )
     for _ in range(2):
         if preload is None:
             break
@@ -209,8 +230,13 @@ def build_arm_pick_plan(obj: dict, arm: str = "left") -> dict:
         if abs(adjusted - preload_compression) < 0.01:
             break
         preload_compression = adjusted
-        preload = _arm_ik(camera_x, camera_y, contact_z, preload_compression, 15.0)
-    lift = _arm_ik(camera_x, camera_y, top + 16.0, 8.0, 45.0)
+        preload = _arm_ik(
+            camera_x, camera_y, contact_z, preload_compression, 15.0,
+            forward_to_center_mm
+        )
+    lift = _arm_ik(
+        camera_x, camera_y, top + 16.0, 8.0, 45.0, forward_to_center_mm
+    )
     poses = (approach, contact, preload, lift)
     if any(p is None or p["error"] > ROBOT_IK_TOLERANCE_MM for p in poses):
         raise ValueError("접근·접촉·예압·상승 자세 중 도달할 수 없는 단계가 있습니다.")
